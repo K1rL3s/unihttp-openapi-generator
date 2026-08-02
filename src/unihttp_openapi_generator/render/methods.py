@@ -20,6 +20,9 @@ from unihttp_openapi_generator.render.engine import render_template
 from unihttp_openapi_generator.render.imports import render_import_lines
 from unihttp_openapi_generator.render.serializers.base import docstring
 
+#: Indent every field line sits at inside a method class body.
+_FIELD_INDENT = "    "
+
 _LOCATION_MARKER = {
     ParamLocation.PATH: "Path",
     ParamLocation.QUERY: "Query",
@@ -30,6 +33,11 @@ _LOCATION_MARKER = {
 
 def tag_module_name(tag: str) -> str:
     return field_name(tag)
+
+
+def _unindent(line: str) -> str:
+    """Strip one class-body indent, so ``render_method_class`` can add it back."""
+    return line[len(_FIELD_INDENT) :] if line.startswith(_FIELD_INDENT) else line
 
 
 def _default_repr(value: object) -> tuple[str, bool]:
@@ -133,10 +141,13 @@ def _collect_field_lines(op: IROperation) -> tuple[list[str], set[str], bool, bo
             uses_omitted = True
             lines.append(f"{spec.py_name}: {spec.marker}[Omittable[{spec.inner}]] = Omitted()")
         # PEP 258 attribute docstring: the only place a parameter's / body field's
-        # schema prose can land without changing the constructor signature.
-        doc = docstring(spec.description, "")
+        # schema prose can land without changing the constructor signature. Rendered
+        # at the indent it will actually sit at -- ``docstring`` wraps to
+        # ``88 - len(indent)`` columns -- then unindented, because the caller adds the
+        # class-body indent back to every line it gets.
+        doc = docstring(spec.description, _FIELD_INDENT)
         if doc:
-            lines.extend(doc.rstrip("\n").split("\n"))
+            lines.extend(_unindent(line) for line in doc.rstrip("\n").split("\n"))
 
     return lines, markers, uses_omitted, uses_field
 
@@ -161,7 +172,9 @@ def render_method_class(op: IROperation) -> tuple[str, set[Import]]:
     if field_lines:
         lines.append("")  # blank line between the unihttp dunders and the parameters
     for line in field_lines:
-        lines.append(f"    {line}")
+        # A blank docstring paragraph separator must stay blank: indenting it would
+        # write trailing whitespace inside the string literal, which no formatter strips.
+        lines.append(f"{_FIELD_INDENT}{line}" if line else "")
 
     imports: set[Import] = {
         Import("dataclasses", "dataclass"),

@@ -392,7 +392,14 @@ What to do with `allOf: [{$ref: Base}, ...]`.
   - A subtype that restates an inherited property just to attach prose, or to relax it
     to nullable, simply **inherits** it: re-declaring `v: str | None` over the base's
     `v: str` is rejected by `mypy --strict`. Genuine narrowings (a `Literal` tag over a
-    `str`) are kept.
+    `str`) are kept, as is a restatement that changes the `default`.
+  - The pinned discriminator tag follows the same rule. If the base types the
+    discriminator property as an enum (`type: {$ref: ButtonKind}`), `Literal['callback']`
+    is not assignable to it, so the subtype inherits `type: ButtonKind` and the tag is
+    not pinned — the class still decodes, it just no longer defaults its own tag.
+  - Two properties whose names collapse onto one Python identifier (`packSize` on the
+    base, `pack_size` on the subtype) stay separate fields: the subtype's is renamed and
+    aliased back to its wire name rather than shadowing the inherited one.
 
   One thing to know: when a discriminated base *does* stay a class, no serializer
   resolves the concrete subtype from a base-class annotation on its own — a field typed

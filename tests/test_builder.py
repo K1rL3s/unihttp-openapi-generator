@@ -1005,11 +1005,14 @@ def test_inheritance_recursive_base_still_subclasses() -> None:
 
 
 def test_inheritance_tag_field_never_collides_with_a_sibling() -> None:
-    """The pinned tag needs its own python name, not one already taken on the subtype.
+    """One identifier cannot carry two wire names, and the tag is the one that keeps it.
 
     ``Type`` and ``type`` snake-case to the same identifier. Emitting both unqualified
     would put two identical attribute names in one class body: the later wins and the
-    discriminator tag is silently destroyed.
+    discriminator tag is silently destroyed. The tag re-declares the base's ``type``, so
+    it has to stay on the base's attribute -- putting it anywhere else leaves two
+    attributes pointing at the same wire key, which adaptix rejects outright. The
+    sibling is the one that gives way and gets an alias.
     """
     spec: dict[str, Any] = {
         "openapi": "3.0.0",
@@ -1041,4 +1044,184 @@ def test_inheritance_tag_field_never_collides_with_a_sibling() -> None:
     assert len(names) == len(set(names)), f"duplicate class attributes: {names}"
     tag = next(f for f in sub.fields if f.wire_name == "type")
     assert tag.type == LiteralType(("a",))
-    assert tag.needs_alias is True  # renamed, so the wire name is restored by an alias
+    assert tag.name == "type"  # overrides B.type, so it must be B.type's attribute
+    sibling = next(f for f in sub.fields if f.wire_name == "Type")
+    assert sibling.name != tag.name
+    assert sibling.needs_alias is True  # renamed, so the wire name is restored by an alias
+
+
+def test_inheritance_tag_not_pinned_over_an_enum_typed_property() -> None:
+    """The pinned tag is an override like any other, so it obeys the narrowing rule.
+
+    A base that types the discriminator property as a ``$ref`` to an enum is the
+    idiomatic OpenAPI form, and ``Literal['callback']`` is not assignable to that enum:
+    ``mypy --strict`` rejects the subclass outright. The subtype inherits the base's
+    declaration instead of emitting an unsound override.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+                "Button": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {"type": {"$ref": "#/components/schemas/ButtonKind"}},
+                    "discriminator": {
+                        "propertyName": "type",
+                        "mapping": {
+                            "callback": "#/components/schemas/CallbackButton",
+                            "link": "#/components/schemas/LinkButton",
+                        },
+                    },
+                },
+                "CallbackButton": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Button"},
+                        {"required": ["payload"], "properties": {"payload": {"type": "string"}}},
+                    ]
+                },
+                "LinkButton": {"allOf": [{"$ref": "#/components/schemas/Button"}]},
+            }
+        },
+    }
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    sub = _decl(ir, "CallbackButton")
+    assert sub.base_model == "Button"
+    assert [f.name for f in sub.fields] == ["payload"]
+    marker = _decl(ir, "LinkButton")
+    assert marker.base_model == "Button"
+    assert marker.fields == []
+    # the base keeps the enum-typed property, so the tag is not lost -- only unpinned
+    base = _decl(ir, "Button")
+    assert [f.type.annotation() for f in base.fields] == ["ButtonKind"]
+
+
+def test_inheritance_checks_the_whole_base_chain() -> None:
+    """A subclass carries only its own fields, so a grandparent's are one hop further.
+
+    ``C`` re-declares ``v`` as an integer over ``A``'s string. Looking only at the direct
+    parent ``B`` finds nothing and lets the unsound override through.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "A": {"type": "object", "required": ["v"], "properties": {"v": {"type": "string"}}},
+                "B": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/A"},
+                        {"properties": {"b": {"type": "string"}}},
+                    ]
+                },
+                "C": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/B"},
+                        {"properties": {"v": {"type": "integer"}, "c": {"type": "string"}}},
+                    ]
+                },
+            }
+        },
+    }
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    assert [f.name for f in _decl(ir, "C").fields] == ["c"]
+
+
+def test_inheritance_renames_a_field_shadowing_an_inherited_identifier() -> None:
+    """Distinct wire names can collapse onto one identifier *across* the hierarchy.
+
+    ``packSize`` on the base and ``pack_size`` on the subtype are different properties,
+    so neither may be dropped -- but one attribute cannot hold both, and the subclass
+    one would shadow the base's with an unrelated type.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "B": {
+                    "type": "object",
+                    "required": ["packSize"],
+                    "properties": {"packSize": {"type": "integer"}},
+                },
+                "A": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/B"},
+                        {"properties": {"pack_size": {"type": "string"}}},
+                    ]
+                },
+            }
+        },
+    }
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    own = next(f for f in _decl(ir, "A").fields if f.wire_name == "pack_size")
+    assert own.name != "pack_size"  # taken by the inherited ``packSize``
+    assert own.needs_alias is True
+
+
+def test_inheritance_keeps_a_restatement_that_changes_the_default() -> None:
+    """An identical annotation is a legal override, so a new ``default`` survives.
+
+    Dropping it would silently hand the subtype the base's value.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "P": {"type": "object", "properties": {"mode": {"type": "string", "default": "f"}}},
+                "C": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/P"},
+                        {"properties": {"mode": {"type": "string", "default": "s"}}},
+                    ]
+                },
+            }
+        },
+    }
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    mode = next(f for f in _decl(ir, "C").fields if f.wire_name == "mode")
+    assert mode.default == "s"
+
+
+def test_allof_subtype_does_not_inherit_the_discriminator() -> None:
+    """A discriminator describes the schema that declares it, not the ones merging it in.
+
+    Copying it down through ``allOf`` marks every concrete subtype as a tagged-union
+    base -- which the renderer then announces in a ``# discriminator:`` header above a
+    class that is nothing of the sort, with a mapping resolved only as far as the walk
+    had got.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.0.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "Pet": {
+                    "type": "object",
+                    "required": ["petType"],
+                    "properties": {"petType": {"type": "string"}},
+                    "discriminator": {
+                        "propertyName": "petType",
+                        "mapping": {"dog": "#/components/schemas/Dog"},
+                    },
+                },
+                "Dog": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Pet"},
+                        {"properties": {"bark": {"type": "boolean"}}},
+                    ]
+                },
+            }
+        },
+    }
+    for inheritance in (False, True):
+        ir = build_ir(spec, RefResolver(spec), inheritance=inheritance)
+        assert _decl(ir, "Dog").discriminator is None, f"inheritance={inheritance}"

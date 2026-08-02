@@ -133,6 +133,7 @@ class SerializerStrategy(ABC):
 
     @staticmethod
     def _discriminator_comment(disc: Discriminator) -> str:
+        """The value -> class mapping a reader needs to wire tagged decoding by hand."""
         mapping = ", ".join(f"{value}={name}" for value, name in sorted(disc.mapping.items()))
         note = f"# discriminator: {disc.property_name}"
         if mapping:
@@ -156,10 +157,8 @@ class SerializerStrategy(ABC):
     def render_alias(self, alias: IRAlias) -> str:
         lines = []
         if alias.discriminator is not None:
-            lines.append(
-                f"# discriminator: {alias.discriminator.property_name} "
-                f"(tagged-union wiring is left to the serializer config)"
-            )
+            # Same note (and the same mapping) a discriminated base kept as a class gets.
+            lines.append(self._discriminator_comment(alias.discriminator))
         lines.append(f"type {alias.name} = {alias.target.annotation()}")
         return "\n".join(lines)
 

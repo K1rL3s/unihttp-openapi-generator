@@ -152,7 +152,13 @@ class PydanticStrategy(SerializerStrategy):
         doc = docstring(model.description, "    ")
         if doc:
             lines.append(doc.rstrip("\n"))
-        lines.append("    model_config = ConfigDict(populate_by_name=True)")
+        if model.base_model is None:
+            # pydantic merges ``model_config`` down the MRO, so repeating it on a
+            # subclass is a no-op that reads like a deliberate override.
+            lines.append("    model_config = ConfigDict(populate_by_name=True)")
+        elif not model.fields and not doc:
+            # ``model_config`` used to keep the body non-empty for free.
+            lines.append("    pass")
         for f in model.fields:
             lines.append("    " + self._field_line(f))
         return "\n".join(lines)
