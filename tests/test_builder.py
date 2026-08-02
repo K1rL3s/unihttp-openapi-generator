@@ -1225,3 +1225,48 @@ def test_allof_subtype_does_not_inherit_the_discriminator() -> None:
     for inheritance in (False, True):
         ir = build_ir(spec, RefResolver(spec), inheritance=inheritance)
         assert _decl(ir, "Dog").discriminator is None, f"inheritance={inheritance}"
+
+
+def test_allof_cycle_terminates_instead_of_recursing() -> None:
+    """An ``allOf`` chain that loops back on itself must not blow the stack.
+
+    ``X: allOf [Y]`` / ``Y: allOf [X]`` describes an infinitely deep object. The merge
+    used to follow it until the interpreter ran out of stack, which also meant the
+    inheritance-cycle break in ``_ordered_declarations`` could never run: nothing ever
+    got as far as having a base chain to break.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "X": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Y"},
+                        {"properties": {"x": {"type": "string"}}},
+                    ]
+                },
+                "Y": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/X"},
+                        {"properties": {"y": {"type": "string"}}},
+                    ]
+                },
+            }
+        },
+    }
+    merged = build_ir(spec, RefResolver(spec))
+    # merge mode: each side ends up with both properties, once
+    assert {f.name for f in _decl(merged, "X").fields} == {"x", "y"}
+    assert {f.name for f in _decl(merged, "Y").fields} == {"x", "y"}
+
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    bases = {decl.name: decl.base_model for decl in ir.declarations if isinstance(decl, IRModel)}
+    # exactly one of the two inheritance edges survives, so the emitted classes resolve
+    assert sorted(bases) == ["X", "Y"]
+    assert len([base for base in bases.values() if base is not None]) == 1
+    names = [decl.name for decl in ir.declarations]
+    for name, base in bases.items():
+        if base is not None:
+            assert names.index(base) < names.index(name)

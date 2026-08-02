@@ -117,3 +117,80 @@ def test_json_object_body_is_spread_into_flat_aliased_body(tmp_path: Path) -> No
         for mod in list(sys.modules):
             if mod == package or mod.startswith(f"{package}."):
                 del sys.modules[mod]
+
+
+# One wire key per line, all seven distinct: ``packSize``/``pack_size`` and
+# ``type``/``Type`` differ only in shape, and each pair snake-cases onto one Python
+# identifier. Losing either half is invisible to ruff and mypy — the subclass simply
+# has one attribute where it should have two — so it takes a round-trip to catch.
+_COLLIDING_PAYLOAD = {
+    "type": "callback",
+    "text": "hello",
+    "packSize": 3,
+    "note": "kept",
+    "payload": "p",
+    "pack_size": "ps",
+    "Type": "T",
+}
+
+
+def _round_trip(serializer: Serializer, models: Any, serialization: Any) -> Any:
+    """Decode ``_COLLIDING_PAYLOAD`` into ``CallbackButton`` and re-encode it."""
+    if serializer is Serializer.PYDANTIC:
+        obj = models.CallbackButton.model_validate(_COLLIDING_PAYLOAD)
+        return obj, obj.model_dump(by_alias=True, mode="json")
+    if serializer is Serializer.MSGSPEC:
+        import msgspec
+
+        obj = msgspec.convert(_COLLIDING_PAYLOAD, models.CallbackButton)
+        return obj, msgspec.to_builtins(obj)
+    obj = serialization.response_loader.load(_COLLIDING_PAYLOAD, models.CallbackButton)
+    return obj, serialization.request_dumper.dump(obj, models.CallbackButton)
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_inheritance_round_trip_keeps_every_wire_key(
+    hierarchy_spec: dict[str, Any], tmp_path: Path, serializer: Serializer
+) -> None:
+    """Every property survives the inheritance rewrite, in every serializer.
+
+    The reconciliation pass renames, drops and re-points fields to keep a subclass
+    assignable to its base. Each of those moves can silently take a property with it:
+    two attributes collapsing onto one identifier drops a value, and two attributes
+    left pointing at one wire key makes adaptix refuse to build the retort outright.
+    """
+    package = f"rt_{serializer.value}"
+    out = tmp_path / "out"
+    spec_path = tmp_path / "spec.json"
+    spec_path.write_text(json.dumps(hierarchy_spec))
+    run_generation(
+        str(spec_path),
+        GeneratorConfig(
+            package_name=package,
+            output_dir=out,
+            serializer=serializer,
+            client=ClientKind.SYNC,
+            inheritance=True,
+        ),
+    )
+    sys.path.insert(0, str(out))
+    try:
+        models = importlib.import_module(f"{package}.models")
+        serialization = importlib.import_module(f"{package}._serialization")
+        obj, dumped = _round_trip(serializer, models, serialization)
+
+        assert isinstance(obj, models.Button)
+        assert dumped == _COLLIDING_PAYLOAD
+
+        # a restatement that only changes the default is the subtype's, not the base's
+        assert models.LinkButton(type=models.ButtonKind.LINK, text="t").note == "link"
+        # the three-level chain keeps the grandparent's fields reachable
+        leaf = models.Leaf(shared="s", wide=1, mid="m")
+        assert (leaf.shared, leaf.wide, leaf.mid) == ("s", 1, "m")
+        # a base whose own body refers back to its subtype still subclasses cleanly
+        assert models.NodeLeaf(id="1", value="v").id == "1"
+    finally:
+        sys.path.remove(str(out))
+        for mod in list(sys.modules):
+            if mod == package or mod.startswith(f"{package}."):
+                del sys.modules[mod]

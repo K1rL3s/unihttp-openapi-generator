@@ -647,7 +647,12 @@ class IRBuilder:
         return RefType(name)
 
     def _flatten_object(
-        self, schema: dict[str, Any], base_uri: str, *, inherited: dict[str, Any] | None = None
+        self,
+        schema: dict[str, Any],
+        base_uri: str,
+        *,
+        inherited: dict[str, Any] | None = None,
+        _chain: frozenset[int] = frozenset(),
     ) -> tuple[dict[str, tuple[Any, str]], set[str], Any, Discriminator | None]:
         """Merge an ``allOf`` chain into one property set.
 
@@ -660,16 +665,31 @@ class IRBuilder:
         schema that declares it, and copying it down makes every subtype look like a
         tagged-union base of the whole family (which the renderer then announces in a
         ``# discriminator:`` header above a concrete class).
+
+        ``_chain`` carries the schemas already open on the current ``allOf`` path. A
+        spec whose chain loops back on itself (``X: allOf [Y]``, ``Y: allOf [X]``)
+        describes an infinitely deep object, and without the guard the walk recurses
+        until the interpreter's stack gives out. The repeated member is skipped
+        instead, leaving the inheritance edge for ``_ordered_declarations`` to break.
+        Identity is the key: every schema stays alive in the resolver's documents for
+        the whole build, and the same pointer always derefs to the same object.
         """
         properties: dict[str, tuple[Any, str]] = {}
         required: set[str] = set()
         additional: Any = None
         discriminator = self._discriminator(schema, base_uri)
+        chain = _chain | {id(schema)}
         for sub in schema.get("allOf", []):
             sub_schema, sub_base = self._deref(sub, base_uri)
             if not isinstance(sub_schema, dict):
                 continue
-            p, r, a, _ = self._flatten_object(sub_schema, sub_base)
+            if id(sub_schema) in chain:
+                logger.warning(
+                    "allOf chain loops back on %s; skipping the repeated member",
+                    sub.get("$ref") if isinstance(sub, dict) else "an inline schema",
+                )
+                continue
+            p, r, a, _ = self._flatten_object(sub_schema, sub_base, _chain=chain)
             if sub is not inherited:
                 properties.update(p)
                 if a is not None:

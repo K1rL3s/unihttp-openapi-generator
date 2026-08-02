@@ -157,3 +157,177 @@ def sample_spec() -> dict[str, Any]:
             },
         },
     }
+
+
+@pytest.fixture
+def hierarchy_spec() -> dict[str, Any]:
+    """A spec whose ``allOf`` shapes all land differently under ``--inheritance``.
+
+    Every schema here stands for one rule the mode has to get right, and each was a
+    real defect at some point: a discriminated base that keeps its own properties, a
+    tag the base types as an enum (so the subtype's ``Literal`` is not assignable),
+    restatements that only add prose / relax to nullable / change a default, wire names
+    that snake-case onto an inherited identifier, a three-level chain, and a base whose
+    own body refers back to its subtype.
+    """
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Hierarchy", "version": "1.0.0"},
+        "servers": [{"url": "https://api.example.com"}],
+        "paths": {
+            "/buttons": {
+                "post": {
+                    "operationId": "createButton",
+                    "tags": ["buttons"],
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/CallbackButton"}
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Button"}
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/leaves": {
+                "get": {
+                    "operationId": "listLeaves",
+                    "tags": ["leaves"],
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/components/schemas/Leaf"},
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+            "/nodes": {
+                "get": {
+                    "operationId": "getNode",
+                    "tags": ["nodes"],
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/NodeLeaf"}
+                                }
+                            },
+                        }
+                    },
+                }
+            },
+        },
+        "components": {
+            "schemas": {
+                "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+                "Button": {
+                    "type": "object",
+                    "description": "A discriminated base with properties of its own.",
+                    "required": ["type", "text"],
+                    "properties": {
+                        # the idiomatic tag: a $ref to an enum, which no Literal narrows
+                        "type": {"$ref": "#/components/schemas/ButtonKind"},
+                        "text": {"type": "string"},
+                        "packSize": {"type": "integer"},
+                        "note": {"type": "string", "default": "base"},
+                    },
+                    "discriminator": {
+                        "propertyName": "type",
+                        "mapping": {
+                            "callback": "#/components/schemas/CallbackButton",
+                            "link": "#/components/schemas/LinkButton",
+                        },
+                    },
+                },
+                "CallbackButton": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Button"},
+                        {
+                            "type": "object",
+                            "required": ["payload"],
+                            "properties": {
+                                "payload": {"type": "string"},
+                                # snake-cases onto the inherited ``pack_size``
+                                "pack_size": {"type": "string"},
+                                # snake-cases onto the inherited ``type``
+                                "Type": {"type": "string"},
+                                # restated only to attach prose
+                                "text": {"type": "string", "description": "Visible label."},
+                            },
+                        },
+                    ]
+                },
+                "LinkButton": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Button"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                # relaxed to nullable: unsound as an override
+                                "text": {"type": "string", "nullable": True},
+                                # changes only the default: a legal override
+                                "note": {"type": "string", "default": "link"},
+                            },
+                        },
+                    ]
+                },
+                "Base": {
+                    "type": "object",
+                    "required": ["shared"],
+                    "properties": {"shared": {"type": "string"}, "wide": {}},
+                },
+                "Middle": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Base"},
+                        {"properties": {"mid": {"type": "string"}}},
+                    ]
+                },
+                "Leaf": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Middle"},
+                        {
+                            "properties": {
+                                # re-declares the *grandparent*'s fields
+                                "shared": {"type": "string"},
+                                "wide": {"type": "integer"},
+                            }
+                        },
+                    ]
+                },
+                "Node": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        # the base's own body refers back to its subtype
+                        "child": {"$ref": "#/components/schemas/NodeLeaf"},
+                    },
+                },
+                "NodeLeaf": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Node"},
+                        {"properties": {"value": {"type": "string"}}},
+                    ]
+                },
+            }
+        },
+    }
