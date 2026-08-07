@@ -457,6 +457,25 @@ uv add --dev unihttp-openapi-generator
 - Swagger / OpenAPI 2.0 is not supported (use the OpenAPI 3 description if a service
   publishes both, as Kubernetes does).
 
+## Without a spec — unihttp's agent skills
+
+[unihttp](https://github.com/goduni/unihttp) ships
+[agent skills](https://github.com/goduni/unihttp#agent-skills) that let a coding agent
+(Claude Code, Codex, …) write the client instead. `unihttp-client` scaffolds the same
+kind of packaged, typed client — models, request classes, a client, `ruff`/`mypy`
+config, and tests — from an OpenAPI 3.x spec **or from a plain description of the API**;
+`unihttp` teaches the agent to write idiomatic unihttp code by hand.
+
+```bash
+claude plugin marketplace add goduni/unihttp
+claude plugin install unihttp@unihttp
+```
+
+Which to use: this generator is deterministic and regenerable — the same spec always
+produces the same package, and it swallows specs far larger than an agent's context.
+Reach for the skill when there is no machine-readable spec at all, or when you want a
+small client shaped by hand as it is written.
+
 ## Development
 
 ```bash
