@@ -114,12 +114,12 @@ class IRBuilder:
         self._root_uri = root_uri
         self._omit_optionals = omit_optionals
         self._inheritance = inheritance
-        # Wire names a model listed in its own ``required``, keyed by ``id(model)``.
+        # Wire names a model listed in its own ``required``, keyed by class name.
         # Under inheritance a subtype routinely tightens a base property by naming it
         # in ``required`` without restating the property, and nothing in ``fields``
         # records that; ``_restore_required_narrowing`` replays it once the base chain
-        # is known. Keyed by identity because it is builder bookkeeping, not IR.
-        self._own_required: dict[int, set[str]] = {}
+        # is known. Kept out of the IR because it is builder bookkeeping.
+        self._own_required: dict[str, set[str]] = {}
         self._strip_segments = self._resolve_strip_segments(strip_prefix)
         self._declarations: dict[str, Declaration] = {}
         # one registry for all top-level class names (models, enums, aliases, method
@@ -228,7 +228,7 @@ class IRBuilder:
         for wire, inherited_field in self._inherited_fields(by_name, base).items():
             if wire in own:
                 continue
-            copied = replace(inherited_field)
+            copied = replace(inherited_field, constraints=dict(inherited_field.constraints))
             copied.name = used.reserve(inherited_field.name)
             model.fields.append(copied)
 
@@ -270,12 +270,19 @@ class IRBuilder:
         override, and ``_drop_unsafe_overrides`` keeps it because requiredness differs.
         """
         own = {f.wire_name for f in model.fields}
-        for wire in sorted(self._own_required.get(id(model), set())):
+        for wire in sorted(self._own_required.get(model.name, set())):
             base_field = inherited.get(wire)
             if wire in own or base_field is None or base_field.required:
                 continue
             model.fields.append(
-                replace(base_field, required=True, default=None, has_default=False, omittable=False)
+                replace(
+                    base_field,
+                    required=True,
+                    default=None,
+                    has_default=False,
+                    omittable=False,
+                    constraints=dict(base_field.constraints),
+                )
             )
 
     @staticmethod
@@ -896,7 +903,7 @@ class IRBuilder:
         # complete; see ``_reconcile_inheritance``. ``required`` has to be carried
         # over separately: a subtype that only tightens an inherited property names it
         # here and contributes no property of its own.
-        self._own_required[id(model)] = set(required)
+        self._own_required[name] = set(required)
         if isinstance(additional, dict):
             model.additional_properties = self._convert(additional, base_uri, name + "Value")
         elif additional is True:

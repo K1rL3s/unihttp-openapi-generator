@@ -94,9 +94,13 @@ def render_declaration_module(
     # TYPE_CHECKING block (and ``from __future__ import annotations`` keeps the
     # annotations lazy). Stdlib/typing/serializer imports stay at runtime.
     imports = {imp for imp in imports if imp.name not in plan.model_modules}
-    runtime = decl.runtime_refs() if isinstance(decl, IRModel) else set()
-    for name in sorted(runtime & plan.model_modules.keys()):
+    runtime = (
+        decl.runtime_refs() & plan.model_modules.keys() if isinstance(decl, IRModel) else set()
+    )
+    for name in sorted(runtime):
         imports.add(Import(plan.model_dotted(package, name), name))
+    # Only what actually got a runtime import leaves the deferred block; anything else
+    # would end up referenced and never imported at all.
     refs = refs - runtime
     body = strategy.render_declaration(decl)
     tc_lines = _type_checking_block(package, plan, refs)
