@@ -6,11 +6,14 @@ from typing import Any
 
 import pytest
 
-from unihttp_openapi_generator.ir.builder import build_ir
+from unihttp_openapi_generator.ir.builder import IRBuilder, build_ir
 from unihttp_openapi_generator.ir.document import IRDocument
 from unihttp_openapi_generator.ir.models import IRAlias, IREnum, IRModel
 from unihttp_openapi_generator.ir.operations import BodyKind, ParamLocation
 from unihttp_openapi_generator.ir.types import (
+    BOOL,
+    INT,
+    STR,
     ListType,
     LiteralType,
     MappingType,
@@ -1451,3 +1454,216 @@ def test_allof_cycle_merges_the_dropped_base_instead_of_losing_its_fields() -> N
     assert {f.wire_name for f in orphan.fields} == {
         f.wire_name for f in _decl(merged, orphan.name).fields
     }
+
+
+# -- narrowing predicate: branches reached only from specific type shapes ------
+
+
+@pytest.mark.parametrize(
+    ("sub", "base", "expected"),
+    [
+        # non-optional sub over an optional base: admitted directly, or via the inner
+        (STR, OptionalType(STR), True),
+        (LiteralType(("a",)), OptionalType(STR), True),
+        (INT, OptionalType(STR), False),
+        # literal over literal: only a subset narrows
+        (LiteralType(("a",)), LiteralType(("a", "b")), True),
+        (LiteralType(("c",)), LiteralType(("a", "b")), False),
+        # union base: narrowing any one member is enough
+        (STR, UnionType((STR, INT)), True),
+        (BOOL, UnionType((STR, INT)), False),
+        # a Literal is answered against the base's *own* shape before the union branch
+        # is reached, so this is a deliberate false no: the subtype inherits the wider
+        # annotation instead of narrowing it. Safe, since a false yes emits code that
+        # fails ``mypy --strict`` while a false no only loses precision.
+        (LiteralType(("a",)), UnionType((STR, INT)), False),
+        # both optional: compare the inners
+        (OptionalType(LiteralType(("a",))), OptionalType(STR), True),
+        (OptionalType(STR), OptionalType(INT), False),
+    ],
+)
+def test_is_narrowing_type_shapes(sub: Any, base: Any, expected: bool) -> None:
+    assert IRBuilder._is_narrowing(sub, base) is expected
+
+
+@pytest.mark.parametrize(
+    ("values", "py", "expected"),
+    [
+        (("a", "b"), "str", True),
+        ((1, 2), "int", True),
+        # bool is a subtype of int, so Literal[True] is assignable to an int base
+        ((True,), "int", True),
+        ((True, False), "bool", True),
+        ((1,), "bool", False),
+        (("a",), "int", False),
+        ((1,), "str", False),
+        # anything else (float, bytes, datetime, ...) is not a Literal-able base
+        ((1.5,), "float", False),
+    ],
+)
+def test_literals_fit_primitive(values: Any, py: str, expected: bool) -> None:
+    assert IRBuilder._literals_fit(values, py) is expected
+
+
+def _builder(spec: dict[str, Any], *, inheritance: bool = True) -> IRBuilder:
+    return IRBuilder(spec, RefResolver(spec), inheritance=inheritance)
+
+
+def test_declares_model_mirrors_build_named_dispatch() -> None:
+    """``_resolve_base_model`` decides from the schema, so the two must not drift."""
+    builder = _builder(_hier({}))
+    assert builder._declares_model("not a dict") is False
+    assert builder._declares_model({"enum": ["a", "b"], "type": "string"}) is False
+    # an enum that also declares properties is still an object
+    assert builder._declares_model({"enum": ["a"], "properties": {"x": {}}}) is True
+    # a discriminated holder is a class only in inheritance mode, and only with structure
+    holder = {"properties": {"k": {}}, "discriminator": {"propertyName": "k", "mapping": {}}}
+    assert builder._declares_model(holder) is True
+    assert _builder(_hier({}), inheritance=False)._declares_model(holder) is False
+    assert builder._declares_model({"properties": {}, "discriminator": {"mapping": {}}}) is False
+    # a discriminator subtype is always concrete, even as a bare marker
+    assert builder._declares_model({"allOf": [{"$ref": "#/x"}]}, is_disc_subtype=True) is True
+    assert builder._declares_model({"allOf": [{"$ref": "#/x"}]}) is False
+
+
+def test_inherited_fields_stops_at_a_non_model_base() -> None:
+    """A base name that resolves to an enum or alias contributes nothing."""
+    by_name: dict[str, Any] = {"E": IREnum(name="E", base="str", members=[("A", "a")])}
+    assert IRBuilder._inherited_fields(by_name, "E") == {}
+    assert IRBuilder._inherited_fields({}, "Missing") == {}
+
+
+def test_retype_discriminator_tag_leaves_non_enum_bases_alone() -> None:
+    """Only a tag whose base declares it as a ``$ref`` to an *enum* is re-typed.
+
+    A ``str``-typed base keeps the plain ``Literal`` (already assignable), a ``$ref`` to
+    a model is not something a tag value can be pinned to, and a defaulted single-value
+    Literal that the base never declares is not a tag at all.
+    """
+    spec = _hier(
+        {
+            "KindObj": {"type": "object", "properties": {"n": {"type": "string"}}},
+            # base types the tag as a plain string -> Literal stays as-is
+            "StrBase": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"type": "string"}},
+                "discriminator": {
+                    "propertyName": "kind",
+                    "mapping": {"one": "#/components/schemas/StrSub"},
+                },
+            },
+            "StrSub": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/StrBase"},
+                    {"required": ["a"], "properties": {"a": {"type": "string"}}},
+                ]
+            },
+            # base types the tag as a ref to a *model* -> nothing to pin a member from
+            "ObjBase": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"$ref": "#/components/schemas/KindObj"}},
+                "discriminator": {
+                    "propertyName": "kind",
+                    "mapping": {"two": "#/components/schemas/ObjSub"},
+                },
+            },
+            "ObjSub": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/ObjBase"},
+                    {"required": ["b"], "properties": {"b": {"type": "string"}}},
+                ]
+            },
+            # a defaulted single-value Literal the base never declares
+            "P": {"type": "object", "properties": {"p": {"type": "string"}}},
+            "OwnLiteral": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {"properties": {"mode": {"enum": ["only"], "default": "only"}}},
+                ]
+            },
+        }
+    )
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+
+    str_tag = next(f for f in _decl(ir, "StrSub").fields if f.wire_name == "kind")
+    assert str_tag.type.annotation() == "Literal['one']"
+    assert str_tag.default_expr is None
+
+    # a model-typed tag admits no member to pin, so the unsound Literal is dropped and
+    # the subtype inherits the base's declaration
+    assert [f.wire_name for f in _decl(ir, "ObjSub").fields] == ["b"]
+
+    own = next(f for f in _decl(ir, "OwnLiteral").fields if f.wire_name == "mode")
+    assert own.default_expr is None
+
+
+def test_allof_cycle_carries_additional_properties_and_required_across() -> None:
+    """The cycle-broken end keeps everything merge mode would have given it.
+
+    Its base edge is gone, so ``_reconcile_inheritance`` skips it -- and the base's
+    ``additionalProperties`` is the one thing ``_flatten_object`` does *not* pull
+    through an inherited member, so it has to be carried over by the merge itself.
+    """
+    spec = _hier(
+        {
+            "X": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Y"},
+                    {"required": ["y"], "properties": {"x": {"type": "string"}}},
+                ]
+            },
+            "Y": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/X"},
+                    {
+                        "properties": {"y": {"type": "string"}},
+                        "additionalProperties": {"type": "string"},
+                    },
+                ]
+            },
+        }
+    )
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    orphan = next(d for d in ir.declarations if isinstance(d, IRModel) and d.base_model is None)
+    # every wire key merge mode would give it, including the other end's
+    assert {f.wire_name for f in orphan.fields} == {"x", "y"}
+    # ``required`` is unioned across the cycle by ``_flatten_object`` before the fields
+    # are built, so the shared property arrives already tightened
+    assert next(f for f in orphan.fields if f.wire_name == "y").required is True
+    # the base's free-form tail, which an inherited member never propagates
+    assert orphan.additional_properties is not None
+    assert orphan.additional_properties.annotation() == "str"
+
+
+def test_retype_discriminator_tag_needs_the_value_to_be_an_enum_member() -> None:
+    """A mapping key outside the base's enum leaves the tag alone.
+
+    The spec is inconsistent -- it tags a subtype with a value the enum it typed the
+    property as does not admit -- so there is no member to pin and the unsound
+    ``Literal`` is dropped rather than guessed at.
+    """
+    spec = _hier(
+        {
+            "Kind": {"type": "string", "enum": ["known"]},
+            "Base": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"$ref": "#/components/schemas/Kind"}},
+                "discriminator": {
+                    "propertyName": "kind",
+                    "mapping": {"absent": "#/components/schemas/Sub"},
+                },
+            },
+            "Sub": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Base"},
+                    {"required": ["a"], "properties": {"a": {"type": "string"}}},
+                ]
+            },
+        }
+    )
+    sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "Sub")
+    assert sub.base_model == "Base"
+    assert [f.wire_name for f in sub.fields] == ["a"]

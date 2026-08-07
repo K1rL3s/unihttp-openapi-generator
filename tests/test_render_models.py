@@ -593,3 +593,43 @@ def test_required_override_is_enforced_at_construction(
     with pytest.raises((TypeError, ValueError)):
         module.C(c="x")
     assert module.C(v="y", c="x").v == "y"
+
+
+def test_inherited_field_names_stops_at_an_unknown_base() -> None:
+    """A base name the document does not declare ends the walk instead of raising."""
+    from unihttp_openapi_generator.ir.document import IRDocument
+    from unihttp_openapi_generator.ir.models import IRModel
+
+    strategy = get_strategy(Serializer.ADAPTIX)
+    orphan = IRModel(name="Orphan", base_model="NotDeclared")
+    strategy.bind_document(
+        IRDocument(title="T", version="1.0.0", base_url=None, declarations=[orphan], operations=[])
+    )
+    assert strategy.inherited_field_names(orphan) == set()
+
+
+def test_pydantic_fieldless_subclass_gets_an_explicit_pass() -> None:
+    """A subclass with no fields and no docstring still needs a body.
+
+    The base's ``model_config`` line used to fill it in for free; skipping it on a
+    subclass (pydantic merges the config down the MRO anyway) leaves the class empty.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "P": {"type": "object", "properties": {"v": {"type": "string"}}},
+                "Marker": {
+                    "allOf": [{"$ref": "#/components/schemas/P"}, {"type": "object"}],
+                },
+            }
+        },
+    }
+    strategy = get_strategy(Serializer.PYDANTIC)
+    doc = build_ir(spec, RefResolver(spec), inheritance=True)
+    strategy.bind_document(doc)
+    source = render_models_module(doc, strategy)
+    assert "class Marker(P):\n    pass" in source
+    compile(format_python(source), "<models>", "exec")

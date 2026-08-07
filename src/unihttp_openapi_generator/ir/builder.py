@@ -240,16 +240,10 @@ class IRBuilder:
             and parent.additional_properties is not None
         ):
             model.additional_properties = parent.additional_properties
-        # ``_reconcile_inheritance`` skips this model from here on -- it has no base
-        # left -- so its own ``required`` tightenings have to be applied to the fields
-        # just merged in, or they would be lost with the base edge.
-        tightened = self._own_required.get(model.name, set())
-        for f in model.fields:
-            if f.wire_name in tightened and not f.required:
-                f.required = True
-                f.has_default = False
-                f.default = None
-                f.omittable = False
+        # No ``required`` replay is needed here even though ``_reconcile_inheritance``
+        # skips this model from now on: ``_flatten_object`` unions ``required`` across
+        # every ``allOf`` member, and a cycle means it flows both ways, so each end
+        # already built the shared field as required.
 
     def _reconcile_inheritance(self, declarations: list[Declaration]) -> None:
         """Make every subclass agree with its base chain (inheritance mode only).
@@ -882,8 +876,10 @@ class IRBuilder:
         same predicate ``_build_named`` will apply when it declares the base.
         """
         base_type = self._convert_ref(inherited["$ref"], base_uri, hint)
-        if not isinstance(base_type, RefType):
-            return None
+        # ``_convert_ref`` names every target it resolves, so this is an invariant
+        # rather than a case to degrade on -- a ``return None`` here would be a branch
+        # no spec can reach.
+        assert isinstance(base_type, RefType)
         declared = self._declarations.get(base_type.name)
         if declared is not None:
             return base_type.name if isinstance(declared, IRModel) else None
