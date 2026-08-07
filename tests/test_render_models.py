@@ -339,3 +339,297 @@ def test_docstring_with_backslash_is_raw_and_warning_free() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # SyntaxWarning -> error
         compile(src, "t.py", "exec")  # must not raise
+
+
+# -- inheritance mode ---------------------------------------------------------------
+
+
+_INHERITED_SPEC: dict[str, Any] = {
+    "openapi": "3.0.0",
+    "info": {"title": "I", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "Button": {
+                "type": "object",
+                "required": ["type", "text"],
+                "properties": {"type": {"type": "string"}, "text": {"type": "string"}},
+                "discriminator": {
+                    "propertyName": "type",
+                    "mapping": {"callback": "#/components/schemas/CallbackButton"},
+                },
+            },
+            "CallbackButton": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Button"},
+                    {"required": ["payload"], "properties": {"payload": {"type": "string"}}},
+                ]
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "serializer", [Serializer.ADAPTIX, Serializer.PYDANTIC, Serializer.MSGSPEC]
+)
+def test_inherited_models_subclass_their_base(serializer: Serializer, tmp_path: Path) -> None:
+    ir = build_ir(_INHERITED_SPEC, RefResolver(_INHERITED_SPEC), inheritance=True)
+    source = format_python(render_models_module(ir, get_strategy(serializer)), filename="models.py")
+    assert "class CallbackButton(Button" in source
+    module = _load(source, tmp_path, f"genmodels_inherit_{serializer.value}")
+    assert issubclass(module.CallbackButton, module.Button)
+    # A subclass pinning an inherited field to a default while adding a required one
+    # of its own only works with keyword-only construction.
+    button = module.CallbackButton(text="hi", payload="p")
+    assert button.type == "callback"
+    assert button.text == "hi"
+
+
+def test_inherited_adaptix_models_are_kw_only() -> None:
+    ir = build_ir(_INHERITED_SPEC, RefResolver(_INHERITED_SPEC), inheritance=True)
+    source = render_models_module(ir, get_strategy(Serializer.ADAPTIX))
+    assert "@dataclass(kw_only=True)\nclass Button:" in source
+    assert "@dataclass(kw_only=True)\nclass CallbackButton(Button):" in source
+
+
+def test_only_hierarchy_members_become_kw_only() -> None:
+    """One ``allOf`` subtype must not silently break every other model's constructor.
+
+    ``kw_only`` is what lets a subclass pin an inherited field to a default while
+    adding required fields of its own -- a constraint that exists only inside a
+    hierarchy. Models outside one keep positional construction.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.0.0",
+        "info": {"title": "I", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                **_INHERITED_SPEC["components"]["schemas"],
+                "Unrelated": {
+                    "type": "object",
+                    "required": ["n"],
+                    "properties": {"n": {"type": "string"}},
+                },
+            }
+        },
+    }
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    source = render_models_module(ir, get_strategy(Serializer.ADAPTIX))
+    assert "@dataclass\nclass Unrelated:" in source
+    assert "@dataclass(kw_only=True)\nclass Button:" in source
+
+
+def test_models_without_inheritance_keep_positional_dataclasses() -> None:
+    ir = build_ir(_INHERITED_SPEC, RefResolver(_INHERITED_SPEC))
+    source = render_models_module(ir, get_strategy(Serializer.ADAPTIX))
+    assert "@dataclass(kw_only=True)" not in source
+
+
+def test_discriminated_base_class_keeps_its_mapping_visible() -> None:
+    """A base kept as a class must not swallow the discriminator it declares.
+
+    No serializer resolves a concrete subtype from a base-class annotation on its own,
+    so the mapping is the one thing a reader needs to wire tagged decoding by hand.
+    Dropping it would leave that information nowhere in the generated package.
+    """
+    ir = build_ir(_INHERITED_SPEC, RefResolver(_INHERITED_SPEC), inheritance=True)
+    source = render_models_module(ir, get_strategy(Serializer.ADAPTIX))
+    assert "# discriminator: type (callback=CallbackButton)" in source
+
+
+# -- review fixes: discriminator comment, docstring width, enum-typed tag ------
+
+
+_MAPPINGLESS_DISCRIMINATOR: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "Pet": {
+                "type": "object",
+                "required": ["petType", "name"],
+                "properties": {"petType": {"type": "string"}, "name": {"type": "string"}},
+                "discriminator": {"propertyName": "petType"},
+            }
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_mappingless_discriminator_emits_no_comment(serializer: Serializer) -> None:
+    """A concrete model that merely names a discriminator property is not a union base.
+
+    ``Pet`` has no subtypes and an empty mapping, so the note would be factually wrong
+    -- and it is emitted in the default merge mode, i.e. for users who never asked for
+    ``--inheritance`` and whose output would change on the next regeneration.
+    """
+    source = _render(_MAPPINGLESS_DISCRIMINATOR, serializer)
+    assert "# discriminator" not in source
+
+
+def test_docstring_wraps_inside_the_line_budget() -> None:
+    """The opening quotes share the first line, so they come out of its budget.
+
+    Ignoring them let the first line run three columns past the limit the wrapper is
+    supposed to enforce.
+    """
+    from unihttp_openapi_generator.render.serializers.base import _DOCSTRING_LINE_LENGTH, docstring
+
+    prose = (
+        "The user's display name, which is a fairly long description intended to wrap "
+        "across more than one rendered line without going over the budget."
+    )
+    for indent in ("", "    ", "        "):
+        rendered = docstring(prose, indent)
+        too_long = [line for line in rendered.splitlines() if len(line) > _DOCSTRING_LINE_LENGTH]
+        assert too_long == [], (indent, too_long)
+
+
+_ENUM_TAG_SPEC: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+            "Button": {
+                "type": "object",
+                "required": ["type", "text"],
+                "properties": {
+                    "type": {"$ref": "#/components/schemas/ButtonKind"},
+                    "text": {"type": "string"},
+                },
+                "discriminator": {
+                    "propertyName": "type",
+                    "mapping": {
+                        "callback": "#/components/schemas/CallbackButton",
+                        "link": "#/components/schemas/LinkButton",
+                    },
+                },
+            },
+            "CallbackButton": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Button"},
+                    {"required": ["payload"], "properties": {"payload": {"type": "string"}}},
+                ]
+            },
+            "LinkButton": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Button"},
+                    {"required": ["url"], "properties": {"url": {"type": "string"}}},
+                ]
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_enum_typed_tag_is_pinned_to_the_enum_member(
+    serializer: Serializer, tmp_path: Path
+) -> None:
+    """The subtype defaults its own tag, and the value survives a round trip.
+
+    Without the pin the subtype is constructible with a sibling's tag and encodes
+    without one unless the caller passes it by hand.
+    """
+    strategy = get_strategy(serializer)
+    doc = build_ir(_ENUM_TAG_SPEC, RefResolver(_ENUM_TAG_SPEC), inheritance=True)
+    strategy.bind_document(doc)
+    source = format_python(render_models_module(doc, strategy))
+    assert "ButtonKind.CALLBACK" in source
+    assert "ButtonKind.LINK" in source
+
+    module = _load(source, tmp_path, f"enumtag_{serializer.value}")
+    button = module.CallbackButton(text="t", payload="p")
+    assert button.type is module.ButtonKind.CALLBACK
+
+
+_SHADOWED_DEFAULT_SPEC: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "P": {"type": "object", "properties": {"v": {"type": "string"}}},
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {
+                        "type": "object",
+                        "required": ["v"],
+                        "properties": {"c": {"type": "string"}},
+                    },
+                ]
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_required_override_is_enforced_at_construction(
+    serializer: Serializer, tmp_path: Path
+) -> None:
+    """Re-declaring an inherited field without a default must actually demand a value.
+
+    ``dataclasses`` resolves a field's default with ``getattr(cls, name)``, which walks
+    the MRO -- so for the adaptix strategy a bare ``v: str | None`` under a base that
+    declares ``v: str | None = None`` silently inherited the default and the tightening
+    was a no-op. pydantic and msgspec build their fields from ``__annotations__`` and
+    were never affected, which is exactly why this needs a construction test rather
+    than an IR one.
+    """
+    strategy = get_strategy(serializer)
+    doc = build_ir(_SHADOWED_DEFAULT_SPEC, RefResolver(_SHADOWED_DEFAULT_SPEC), inheritance=True)
+    strategy.bind_document(doc)
+    source = format_python(render_models_module(doc, strategy))
+    module = _load(source, tmp_path, f"shadow_{serializer.value}")
+
+    with pytest.raises((TypeError, ValueError)):
+        module.C(c="x")
+    assert module.C(v="y", c="x").v == "y"
+
+
+def test_inherited_field_names_stops_at_an_unknown_base() -> None:
+    """A base name the document does not declare ends the walk instead of raising."""
+    from unihttp_openapi_generator.ir.document import IRDocument
+    from unihttp_openapi_generator.ir.models import IRModel
+
+    strategy = get_strategy(Serializer.ADAPTIX)
+    orphan = IRModel(name="Orphan", base_model="NotDeclared")
+    strategy.bind_document(
+        IRDocument(title="T", version="1.0.0", base_url=None, declarations=[orphan], operations=[])
+    )
+    assert strategy.inherited_field_names(orphan) == set()
+
+
+def test_pydantic_fieldless_subclass_gets_an_explicit_pass() -> None:
+    """A subclass with no fields and no docstring still needs a body.
+
+    The base's ``model_config`` line used to fill it in for free; skipping it on a
+    subclass (pydantic merges the config down the MRO anyway) leaves the class empty.
+    """
+    spec: dict[str, Any] = {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {
+            "schemas": {
+                "P": {"type": "object", "properties": {"v": {"type": "string"}}},
+                "Marker": {
+                    "allOf": [{"$ref": "#/components/schemas/P"}, {"type": "object"}],
+                },
+            }
+        },
+    }
+    strategy = get_strategy(Serializer.PYDANTIC)
+    doc = build_ir(spec, RefResolver(spec), inheritance=True)
+    strategy.bind_document(doc)
+    source = render_models_module(doc, strategy)
+    assert "class Marker(P):\n    pass" in source
+    compile(format_python(source), "<models>", "exec")

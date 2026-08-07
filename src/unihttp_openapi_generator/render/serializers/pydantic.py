@@ -11,6 +11,7 @@ from unihttp_openapi_generator.ir.naming import field_name
 from unihttp_openapi_generator.ir.types import Import, LiteralType, RefType, UnionType
 from unihttp_openapi_generator.render.serializers.base import (
     SerializerStrategy,
+    default_source,
     docstring,
     literal_repr,
 )
@@ -148,11 +149,17 @@ class PydanticStrategy(SerializerStrategy):
         return safe
 
     def render_model(self, model: IRModel) -> str:
-        lines = [f"class {model.name}(BaseModel):"]
+        lines = [f"class {model.name}({model.base_model or 'BaseModel'}):"]
         doc = docstring(model.description, "    ")
         if doc:
             lines.append(doc.rstrip("\n"))
-        lines.append("    model_config = ConfigDict(populate_by_name=True)")
+        if model.base_model is None:
+            # pydantic merges ``model_config`` down the MRO, so repeating it on a
+            # subclass is a no-op that reads like a deliberate override.
+            lines.append("    model_config = ConfigDict(populate_by_name=True)")
+        elif not model.fields and not doc:
+            # ``model_config`` used to keep the body non-empty for free.
+            lines.append("    pass")
         for f in model.fields:
             lines.append("    " + self._field_line(f))
         return "\n".join(lines)
@@ -170,21 +177,21 @@ class PydanticStrategy(SerializerStrategy):
                 args.append(f"{pyd_key}={literal_repr(f.constraints[key])}")
 
         if f.has_default:
-            default = self._default_arg(f.default)
+            default = self._default_arg(f)
             if args:
                 return f"{py_name}: {annotation} = pydantic.Field({default}, {', '.join(args)})"
             if isinstance(f.default, list | dict):
                 return f"{py_name}: {annotation} = pydantic.Field({default})"
-            return f"{py_name}: {annotation} = {literal_repr(f.default)}"
+            return f"{py_name}: {annotation} = {default_source(f)}"
         if args:
             return f"{py_name}: {annotation} = pydantic.Field({', '.join(args)})"
         return f"{py_name}: {annotation}"
 
     @staticmethod
-    def _default_arg(value: Any) -> str:
-        if isinstance(value, list | dict):
-            return f"default_factory=lambda: {value!r}"
-        return f"default={literal_repr(value)}"
+    def _default_arg(f: IRField) -> str:
+        if isinstance(f.default, list | dict):
+            return f"default_factory=lambda: {f.default!r}"
+        return f"default={default_source(f)}"
 
     def needs_model_rebuild(self) -> bool:
         return True

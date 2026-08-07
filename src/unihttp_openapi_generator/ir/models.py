@@ -28,6 +28,14 @@ class IRField:
     description: str | None = None
     default: Any = None
     has_default: bool = False
+    default_expr: str | None = None
+    """Python source for the default, when it is not expressible as a bare literal.
+
+    Set for an enum-typed discriminator tag (``ButtonKind.CALLBACK``), which has to be
+    written as an attribute access rather than the ``'callback'`` that ``default``
+    holds. Renderers emit this verbatim in place of ``repr(default)``; the referenced
+    class is reported by ``runtime_refs`` so the module imports it at runtime.
+    """
     omittable: bool = False
     read_only: bool = False
     write_only: bool = False
@@ -47,6 +55,17 @@ class IRModel:
     description: str | None = None
     additional_properties: IRType | None = None
     discriminator: Discriminator | None = None
+    base_model: str | None = None
+    """Name of the model this one inherits from (inheritance mode only).
+
+    Set when the schema is ``allOf: [{$ref: Base}, ...]`` and the builder ran with
+    ``inheritance=True``; ``fields`` then holds only this model's *own* properties.
+    Without that flag the base's properties are merged in and this stays None.
+
+    Deliberately *not* named ``base``: ``IREnum.base`` is the enum's value type
+    ("str"/"int"), so a ``getattr(decl, "base", None)`` loop over declarations would
+    silently read an enum's ``"str"`` as a superclass name.
+    """
 
     def imports(self) -> set[Import]:
         imports: set[Import] = set()
@@ -62,6 +81,22 @@ class IRModel:
             names |= f.type.referenced_models()
         if self.additional_properties is not None:
             names |= self.additional_properties.referenced_models()
+        if self.base_model is not None:
+            names.add(self.base_model)
+        return names - {self.name}
+
+    def runtime_refs(self) -> set[str]:
+        """Declarations this model evaluates at class-definition time.
+
+        Everything else lives inside an annotation and stays deferred, but a base class
+        in the ``class Sub(Base)`` statement and a class referenced by a default
+        expression are both evaluated when the module is imported, so a split layout
+        has to import them for real rather than under ``TYPE_CHECKING``.
+        """
+        names = {self.base_model} if self.base_model is not None else set()
+        for f in self.fields:
+            if f.default_expr is not None:
+                names.add(f.default_expr.partition(".")[0])
         return names - {self.name}
 
 

@@ -20,6 +20,9 @@ from unihttp_openapi_generator.render.engine import render_template
 from unihttp_openapi_generator.render.imports import render_import_lines
 from unihttp_openapi_generator.render.serializers.base import docstring
 
+#: Indent every field line sits at inside a method class body.
+_FIELD_INDENT = "    "
+
 _LOCATION_MARKER = {
     ParamLocation.PATH: "Path",
     ParamLocation.QUERY: "Query",
@@ -30,6 +33,11 @@ _LOCATION_MARKER = {
 
 def tag_module_name(tag: str) -> str:
     return field_name(tag)
+
+
+def _unindent(line: str) -> str:
+    """Strip one class-body indent, so ``render_method_class`` can add it back."""
+    return line[len(_FIELD_INDENT) :] if line.startswith(_FIELD_INDENT) else line
 
 
 def _default_repr(value: object) -> tuple[str, bool]:
@@ -54,6 +62,7 @@ class OperationField:
     has_default: bool
     default: object
     is_factory: bool  # default needs ``field(default_factory=...)`` semantics
+    description: str | None = None  # schema prose, rendered as an attribute docstring
 
 
 def operation_fields(op: IROperation) -> list[OperationField]:
@@ -68,9 +77,12 @@ def operation_fields(op: IROperation) -> list[OperationField]:
         is_required: bool,
         has_default: bool,
         default: object,
+        description: str | None = None,
     ) -> None:
         is_factory = has_default and not is_required and isinstance(default, list | dict)
-        spec = OperationField(name, marker, inner, is_required, has_default, default, is_factory)
+        spec = OperationField(
+            name, marker, inner, is_required, has_default, default, is_factory, description
+        )
         (required if is_required else optional).append(spec)
 
     for param in op.parameters:
@@ -82,6 +94,7 @@ def operation_fields(op: IROperation) -> list[OperationField]:
             param.required,
             param.has_default,
             param.default,
+            param.description,
         )
 
     if op.body is not None:
@@ -96,7 +109,15 @@ def operation_fields(op: IROperation) -> list[OperationField]:
                     marker = "Body"
                 else:
                     marker = "Form"
-                add(f.name, marker, f.type.annotation(), f.required, f.has_default, f.default)
+                add(
+                    f.name,
+                    marker,
+                    f.type.annotation(),
+                    f.required,
+                    f.has_default,
+                    f.default,
+                    f.description,
+                )
 
     return [*required, *optional]
 
@@ -119,6 +140,14 @@ def _collect_field_lines(op: IROperation) -> tuple[list[str], set[str], bool, bo
         else:
             uses_omitted = True
             lines.append(f"{spec.py_name}: {spec.marker}[Omittable[{spec.inner}]] = Omitted()")
+        # PEP 258 attribute docstring: the only place a parameter's / body field's
+        # schema prose can land without changing the constructor signature. Rendered
+        # at the indent it will actually sit at -- ``docstring`` wraps to
+        # ``88 - len(indent)`` columns -- then unindented, because the caller adds the
+        # class-body indent back to every line it gets.
+        doc = docstring(spec.description, _FIELD_INDENT)
+        if doc:
+            lines.extend(_unindent(line) for line in doc.rstrip("\n").split("\n"))
 
     return lines, markers, uses_omitted, uses_field
 
@@ -143,7 +172,9 @@ def render_method_class(op: IROperation) -> tuple[str, set[Import]]:
     if field_lines:
         lines.append("")  # blank line between the unihttp dunders and the parameters
     for line in field_lines:
-        lines.append(f"    {line}")
+        # A blank docstring paragraph separator must stay blank: indenting it would
+        # write trailing whitespace inside the string literal, which no formatter strips.
+        lines.append(f"{_FIELD_INDENT}{line}" if line else "")
 
     imports: set[Import] = {
         Import("dataclasses", "dataclass"),

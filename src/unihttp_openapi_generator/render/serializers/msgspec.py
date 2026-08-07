@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from unihttp_openapi_generator.config import Serializer
 from unihttp_openapi_generator.ir.document import IRDocument
 from unihttp_openapi_generator.ir.models import Declaration, IRField, IRModel
 from unihttp_openapi_generator.ir.types import Import
 from unihttp_openapi_generator.render.serializers.base import (
     SerializerStrategy,
+    default_source,
     docstring,
     literal_repr,
 )
@@ -67,7 +66,9 @@ class MsgspecStrategy(SerializerStrategy):
         return (f.has_default, f.needs_alias)
 
     def render_model(self, model: IRModel) -> str:
-        lines = [f"class {model.name}(Struct):"]
+        # See the adaptix strategy: inheritance forces keyword-only constructors.
+        options = ", kw_only=True" if self.is_kw_only(model) else ""
+        lines = [f"class {model.name}({model.base_model or 'Struct'}{options}):"]
         doc = docstring(model.description, "    ")
         if doc:
             lines.append(doc.rstrip("\n"))
@@ -90,7 +91,7 @@ class MsgspecStrategy(SerializerStrategy):
             if isinstance(f.default, list | dict):
                 args.append(f"default_factory=lambda: {f.default!r}")
             else:
-                args.append(f"default={literal_repr(f.default)}")
+                args.append(f"default={default_source(f)}")
         if args:
             return f"{f.name}: {annotation} = msgspec.field({', '.join(args)})"
         return f"{f.name}: {annotation}"
@@ -103,7 +104,3 @@ class MsgspecStrategy(SerializerStrategy):
         if resolve:
             body = f"resolve_forward_refs()\n\n{body}"
         return f'"""Serialization wiring (msgspec)."""\n\n{imports}\n{body}'
-
-    @staticmethod
-    def _default_repr(value: Any) -> str:  # pragma: no cover - parity helper
-        return literal_repr(value)

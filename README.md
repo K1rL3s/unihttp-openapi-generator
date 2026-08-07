@@ -204,6 +204,7 @@ unihttp-openapi-generator generate SPEC [options]
 | `--style` | `declarative` · `imperative` (`declarative`) |
 | `--optional` | `none` · `omitted` (`none`) — `omitted` distinguishes absent from null (adaptix) |
 | `--strip-prefix` | `auto` or a dotted prefix to drop from schema names (e.g. `io.k8s.api.core.v1.Pod` → `CoreV1Pod`) |
+| `--inheritance` | off by default — render `allOf: [$ref]` as a base class instead of merging its fields in |
 | `--check` | run `ruff` and `mypy --strict` on the output |
 | `--config` | TOML config file |
 
@@ -248,6 +249,7 @@ file_layout = "single"        # single | per-object       (files on disk)
 style = "declarative"         # declarative | imperative  (method style)
 optional = "none"             # none | omitted            (optional model fields)
 strip_prefix = "auto"         # "auto" or a dotted prefix to drop from schema names
+inheritance = false           # allOf: [$ref] -> a base class instead of merged fields
 check = true                  # run ruff + mypy --strict on the output
 ```
 
@@ -343,12 +345,86 @@ How optional model fields are represented (adaptix only).
   middle_name: Omittable[str | None] = Omitted()
   ```
 
+### Inheritance — `--inheritance`
+
+What to do with `allOf: [{$ref: Base}, ...]`.
+
+- off (default) — the base's properties are **merged into** each subtype, and a base
+  with a `discriminator` becomes a union alias:
+  ```python
+  @dataclass
+  class CallbackButton:
+      text: str                              # copied from Button
+      payload: str
+      type: Literal['callback'] = 'callback'
+
+  type Button = CallbackButton | LinkButton
+  ```
+- `--inheritance` — the base stays a class and subtypes **inherit** from it, keeping
+  only their own properties plus the discriminator tag:
+  ```python
+  @dataclass(kw_only=True)
+  class Button:
+      type: str
+      text: str
+
+  @dataclass(kw_only=True)
+  class CallbackButton(Button):
+      payload: str
+      type: Literal['callback'] = 'callback'
+  ```
+  `isinstance` then works across the hierarchy, and a subtype's own properties stay in
+  one place instead of being copied into every variant.
+
+  Scope and rules:
+
+  - Only an `allOf` with exactly **one** `$ref` maps onto a base class — several refs
+    are mixin-style composition with no single parent to pick, so those keep the merge
+    behaviour. So does a `$ref` to an enum or a non-object schema.
+  - Only a base that declares **at least one property of its own** becomes a class. The
+    usual polymorphism idiom puts the discriminator on a bare `oneOf` holder with no
+    properties (written either as no `properties` key or as an empty `properties: {}`);
+    there is nothing to inherit from it, so it stays a union alias
+    (`type Button = CallbackButton | LinkButton`) and keeps decoding into the concrete
+    variant. `--inheritance` only changes how the subtypes get *their* shared fields.
+  - Constructors become keyword-only **for the models in a hierarchy** — a subclass may
+    pin an inherited field to a default while adding required fields of its own, which
+    positional ordering cannot express. Models outside every hierarchy are untouched.
+  - A subtype that restates an inherited property just to attach prose, or to relax it
+    to nullable, simply **inherits** it: re-declaring `v: str | None` over the base's
+    `v: str` is rejected by `mypy --strict`. Genuine narrowings are kept — including a
+    `Literal` tag over a `str` base, but not over a base of a different scalar type
+    (`Literal['one', 'two']` does not narrow an `int`). So is a restatement that changes
+    the `default`, tightens the `constraints`, or makes the field `required`.
+  - Naming an inherited property in the subtype's `required` **without** restating the
+    property still tightens it: the subtype re-declares it with the base's annotation
+    and no default, so the constructor demands it.
+  - The discriminator tag is pinned even when the base types the property as an enum
+    (`type: {$ref: ButtonKind}`) — the idiomatic form. `Literal['callback']` is not
+    assignable to `ButtonKind`, so the subtype pins the matching **member** instead:
+    ```python
+    class CallbackButton(Button):
+        type: ButtonKind = ButtonKind.CALLBACK
+        payload: str
+    ```
+  - Two properties whose names collapse onto one Python identifier (`packSize` on the
+    base, `pack_size` on the subtype) stay separate fields: the subtype's is renamed and
+    aliased back to its wire name rather than shadowing the inherited one.
+
+  One thing to know: when a discriminated base *does* stay a class, no serializer
+  resolves the concrete subtype from a base-class annotation on its own — a field typed
+  `Button` decodes into `Button`. The generated class carries a
+  `# discriminator: type (callback=CallbackButton, ...)` comment with the mapping so
+  the tagged decoding can be wired in `_serialization.py`. Leave `--inheritance` off if
+  you want polymorphic responses to parse into subtypes out of the box.
+
 ## OpenAPI coverage
 
 - 3.0 and 3.1; JSON or YAML; file or URL; internal and external `$ref`.
-- Schemas: objects, `allOf` merge, `oneOf`/`anyOf`, discriminator (including
-  polymorphic bases), enums and `const`, formats, nullable, `additionalProperties`,
-  constraints, recursion, and `readOnly` (excluded from request bodies).
+- Schemas: objects, `allOf` (merged, or real inheritance with `--inheritance`),
+  `oneOf`/`anyOf`, discriminator (including polymorphic bases), enums and `const`,
+  formats, nullable, `additionalProperties`, constraints, recursion, and `readOnly`
+  (excluded from request bodies).
 - Operations: path/query/header parameters with defaults, JSON/form/multipart bodies,
   file uploads, typed responses, and `deprecated`.
 - Security: apiKey, http bearer/basic, oauth2, openIdConnect.
