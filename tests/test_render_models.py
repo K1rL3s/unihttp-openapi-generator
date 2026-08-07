@@ -547,3 +547,49 @@ def test_enum_typed_tag_is_pinned_to_the_enum_member(
     module = _load(source, tmp_path, f"enumtag_{serializer.value}")
     button = module.CallbackButton(text="t", payload="p")
     assert button.type is module.ButtonKind.CALLBACK
+
+
+_SHADOWED_DEFAULT_SPEC: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "P": {"type": "object", "properties": {"v": {"type": "string"}}},
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {
+                        "type": "object",
+                        "required": ["v"],
+                        "properties": {"c": {"type": "string"}},
+                    },
+                ]
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_required_override_is_enforced_at_construction(
+    serializer: Serializer, tmp_path: Path
+) -> None:
+    """Re-declaring an inherited field without a default must actually demand a value.
+
+    ``dataclasses`` resolves a field's default with ``getattr(cls, name)``, which walks
+    the MRO -- so for the adaptix strategy a bare ``v: str | None`` under a base that
+    declares ``v: str | None = None`` silently inherited the default and the tightening
+    was a no-op. pydantic and msgspec build their fields from ``__annotations__`` and
+    were never affected, which is exactly why this needs a construction test rather
+    than an IR one.
+    """
+    strategy = get_strategy(serializer)
+    doc = build_ir(_SHADOWED_DEFAULT_SPEC, RefResolver(_SHADOWED_DEFAULT_SPEC), inheritance=True)
+    strategy.bind_document(doc)
+    source = format_python(render_models_module(doc, strategy))
+    module = _load(source, tmp_path, f"shadow_{serializer.value}")
+
+    with pytest.raises((TypeError, ValueError)):
+        module.C(c="x")
+    assert module.C(v="y", c="x").v == "y"

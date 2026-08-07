@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from typing import Any
 
 from unihttp_openapi_generator.config import Serializer
@@ -25,7 +26,7 @@ class AdaptixStrategy(SerializerStrategy):
     def declaration_imports(self, decl: Declaration) -> set[Import]:
         imports = super().declaration_imports(decl)
         if isinstance(decl, IRModel):
-            if self._has_factory_default(decl):
+            if self._has_factory_default(decl) or self._shadows_inherited_default(decl):
                 # Qualify as ``dataclasses.field(...)`` (bare ``import dataclasses``) so a
                 # model field named ``field`` can't shadow the imported helper.
                 imports.add(Import("dataclasses", ""))
@@ -37,6 +38,13 @@ class AdaptixStrategy(SerializerStrategy):
     @staticmethod
     def _has_factory_default(model: IRModel) -> bool:
         return any(f.has_default and isinstance(f.default, list | dict) for f in model.fields)
+
+    def _shadows_inherited_default(self, model: IRModel) -> bool:
+        """Whether any defaultless field re-declares an inherited name (see ``_field_line``)."""
+        inherited = self.inherited_field_names(model)
+        return any(
+            not f.has_default and not f.omittable and f.name in inherited for f in model.fields
+        )
 
     def render_model(self, model: IRModel) -> str:
         # Keyword-only for the models in an inheritance hierarchy: a subclass may pin an
@@ -52,8 +60,9 @@ class AdaptixStrategy(SerializerStrategy):
         fields = sorted(model.fields, key=lambda f: f.has_default or f.omittable)
         if not fields and not doc:
             lines.append("    pass")
+        inherited = self.inherited_field_names(model)
         for f in fields:
-            lines.append("    " + self._field_line(f.name, f.type.annotation(), f))
+            lines.append("    " + self._field_line(f.name, f.type.annotation(), f, inherited))
         return "\n".join(lines)
 
     @staticmethod
@@ -62,13 +71,26 @@ class AdaptixStrategy(SerializerStrategy):
             return f"dataclasses.field(default_factory=lambda: {field_obj.default!r})"
         return default_source(field_obj)
 
-    def _field_line(self, name: str, annotation: str, field_obj: Any) -> str:
+    def _field_line(
+        self,
+        name: str,
+        annotation: str,
+        field_obj: Any,
+        inherited: Collection[str] = (),
+    ) -> str:
         # NOTE: adaptix has no built-in runtime constraint enforcement equivalent to
         # pydantic's Field(...) / msgspec.Meta(...), so IR ``constraints`` are not
         # emitted for the adaptix strategy (unsupported for now).
         if field_obj.omittable:
             return f"{name}: Omittable[{annotation}] = Omitted()"
         if not field_obj.has_default:
+            if name in inherited:
+                # A bare re-declaration does NOT make the field required again:
+                # ``dataclasses`` resolves a field's default with ``getattr(cls, name)``,
+                # which walks the MRO and finds the base's class attribute. An explicit
+                # ``field()`` carries no default, so it shadows the inherited one and
+                # the constructor demands the value the subtype says is required.
+                return f"{name}: {annotation} = dataclasses.field()"
             return f"{name}: {annotation}"
         return f"{name}: {annotation} = {self._default_repr(field_obj)}"
 

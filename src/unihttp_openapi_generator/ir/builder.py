@@ -231,6 +231,25 @@ class IRBuilder:
             copied = replace(inherited_field, constraints=dict(inherited_field.constraints))
             copied.name = used.reserve(inherited_field.name)
             model.fields.append(copied)
+        # ``additionalProperties`` is merged up the ``allOf`` chain in merge mode, so
+        # dropping it here would still decode fewer wire keys than the default does.
+        parent = by_name.get(base)
+        if (
+            isinstance(parent, IRModel)
+            and model.additional_properties is None
+            and parent.additional_properties is not None
+        ):
+            model.additional_properties = parent.additional_properties
+        # ``_reconcile_inheritance`` skips this model from here on -- it has no base
+        # left -- so its own ``required`` tightenings have to be applied to the fields
+        # just merged in, or they would be lost with the base edge.
+        tightened = self._own_required.get(model.name, set())
+        for f in model.fields:
+            if f.wire_name in tightened and not f.required:
+                f.required = True
+                f.has_default = False
+                f.default = None
+                f.omittable = False
 
     def _reconcile_inheritance(self, declarations: list[Declaration]) -> None:
         """Make every subclass agree with its base chain (inheritance mode only).
@@ -315,6 +334,13 @@ class IRBuilder:
             member = next((m for m, value in enum_decl.members if value == f.default), None)
             if member is None:
                 continue
+            # The base's own annotation, not ``Literal[Kind.A]``. The literal form
+            # would be tighter -- it rejects a sibling's tag and keeps pydantic's
+            # tagged-union wiring, which needs a ``Literal`` -- but msgspec refuses to
+            # build a struct from ``Literal[<StrEnum member>]`` ("Literal may only
+            # contain None/integers/strings"), and the IR is shared by all three
+            # serializers. So the subtype pins the member and stays constructible with
+            # a sibling's tag; that is the narrower gap of the two.
             f.type = declared
             f.default_expr = f"{enum_decl.name}.{member}"
 
@@ -484,6 +510,11 @@ class IRBuilder:
                 f.omittable = False
                 return
         if decl.base_model is None:
+            # No base class to have taken the property: the subtype simply does not
+            # declare the tag, which the *default* mode has always rendered the same
+            # way. Synthesizing one here would invent a field no schema declares and
+            # would change the output of every existing merge-mode user, so the gap
+            # is left as it is in both modes.
             return
         # Inheritance mode: the tag property is declared by the base class, so the
         # subtype re-declares it pinned to its own tag. The python name has to be
@@ -640,9 +671,9 @@ class IRBuilder:
         which passes ``_is_object`` and would become an empty ``class Base: pass``
         that every payload annotated with it decodes into, losing all of its fields.
         """
-        if IRBuilder._singleton_allof_ref(schema) is not None:
-            return False
-        return bool(schema.get("properties")) or bool(schema.get("allOf"))
+        return IRBuilder._is_object(schema) and (
+            bool(schema.get("properties")) or bool(schema.get("allOf"))
+        )
 
     @staticmethod
     def _split_nullable(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -903,7 +934,8 @@ class IRBuilder:
         # complete; see ``_reconcile_inheritance``. ``required`` has to be carried
         # over separately: a subtype that only tightens an inherited property names it
         # here and contributes no property of its own.
-        self._own_required[name] = set(required)
+        if self._inheritance:
+            self._own_required[name] = set(required)
         if isinstance(additional, dict):
             model.additional_properties = self._convert(additional, base_uri, name + "Value")
         elif additional is True:
@@ -936,15 +968,22 @@ class IRBuilder:
             if f.type.annotation() == base_field.type.annotation() and self._refines(f, base_field):
                 kept.append(f)
                 continue
-            if f.type.annotation() == base_field.type.annotation():
+            widened = isinstance(f.type, OptionalType) and not isinstance(
+                base_field.type, OptionalType
+            )
+            if f.type.annotation() == base_field.type.annotation() or widened:
                 # A verbatim restatement (spec prose, usually): the base's declaration
                 # already says everything this one does, so nothing is lost by
                 # inheriting it and there is nothing for the user to act on.
+                # Restating a property to attach prose, or to relax it to nullable, is
+                # something specs do routinely and the README documents as inherited --
+                # so it is not something the user can or should act on.
                 logger.debug(
-                    "%s.%s restates inherited %s verbatim; inheriting instead",
+                    "%s.%s restates inherited %s (%s); inheriting instead",
                     model.name,
                     f.name,
                     f.wire_name,
+                    f.type.annotation(),
                 )
             else:
                 # This one *does* lose information -- the subtype asked for a type the
@@ -1060,7 +1099,8 @@ class IRBuilder:
         if py == "bool":
             return all(isinstance(v, bool) for v in values)
         if py == "int":
-            return all(isinstance(v, int) and not isinstance(v, bool) for v in values)
+            # ``bool`` is a subtype of ``int``: ``Literal[True]`` is assignable to it.
+            return all(isinstance(v, int) for v in values)
         if py == "str":
             return all(isinstance(v, str) for v in values)
         return False

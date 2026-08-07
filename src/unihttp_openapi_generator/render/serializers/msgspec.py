@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from unihttp_openapi_generator.config import Serializer
 from unihttp_openapi_generator.ir.document import IRDocument
 from unihttp_openapi_generator.ir.models import Declaration, IRField, IRModel
@@ -106,7 +104,3 @@ class MsgspecStrategy(SerializerStrategy):
         if resolve:
             body = f"resolve_forward_refs()\n\n{body}"
         return f'"""Serialization wiring (msgspec)."""\n\n{imports}\n{body}'
-
-    @staticmethod
-    def _default_repr(value: Any) -> str:  # pragma: no cover - parity helper
-        return literal_repr(value)

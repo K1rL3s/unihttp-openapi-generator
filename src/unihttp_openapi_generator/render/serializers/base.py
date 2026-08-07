@@ -123,6 +123,20 @@ class SerializerStrategy(ABC):
         """Whether ``model``'s constructor must be keyword-only (see ``bind_document``)."""
         return model.name in self._kw_only_models
 
+    def inherited_field_names(self, model: IRModel) -> set[str]:
+        """Python attribute names ``model`` inherits from its whole base chain."""
+        names: set[str] = set()
+        seen: set[str] = set()
+        current = model.base_model
+        while current is not None and current not in seen:
+            seen.add(current)
+            parent = self.models_by_name.get(current)
+            if parent is None:
+                break
+            names |= {f.name for f in parent.fields}
+            current = parent.base_model
+        return names
+
     # -- imports ---------------------------------------------------------------
 
     @abstractmethod
@@ -148,11 +162,12 @@ class SerializerStrategy(ABC):
         # A discriminated base kept as a class (inheritance mode). No serializer
         # resolves a subtype from a base-class annotation on its own, so surface the
         # mapping instead of dropping it: it is what a reader needs to wire tagged
-        # decoding by hand. Gated on there being something to say -- a plain object
-        # that merely declares ``discriminator: {propertyName: ...}`` with no mapping
-        # is a concrete model with no subtypes, and announcing it as a union base
-        # would be wrong as well as new output for every existing default-mode user.
-        if decl.discriminator is not None and (decl.base_model or decl.discriminator.mapping):
+        # decoding by hand. The mapping alone is the gate -- without one there is
+        # nothing to say, and the note would announce a concrete model (a leaf
+        # subclass, or a plain object that merely names a discriminator property) as a
+        # union base. ``base_model`` is no proxy for it: a subclass is the opposite of
+        # a union base, while a base kept as a class always has a mapping.
+        if decl.discriminator is not None and decl.discriminator.mapping:
             body = f"{self._discriminator_comment(decl.discriminator)}\n{body}"
         return body
 
@@ -181,8 +196,9 @@ class SerializerStrategy(ABC):
 
     def render_alias(self, alias: IRAlias) -> str:
         lines = []
-        if alias.discriminator is not None:
-            # Same note (and the same mapping) a discriminated base kept as a class gets.
+        if alias.discriminator is not None and alias.discriminator.mapping:
+            # Same note (and the same gate) a discriminated base kept as a class gets:
+            # a mapping-less discriminator leaves nothing for a reader to wire from.
             lines.append(self._discriminator_comment(alias.discriminator))
         lines.append(f"type {alias.name} = {alias.target.annotation()}")
         return "\n".join(lines)
