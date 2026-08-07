@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from unihttp_openapi_generator import postprocess
 from unihttp_openapi_generator.postprocess import (
     PostProcessError,
     format_path,
@@ -22,14 +22,12 @@ class _Completed:
         self.stderr = "stderr"
 
 
-def test_ruff_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: None)
-    with pytest.raises(PostProcessError, match="ruff executable not found"):
-        format_python("x = 1\n")
+@pytest.fixture
+def stub_ruff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(postprocess, "ruff_executable", lambda: "/usr/bin/ruff")
 
 
-def test_format_python_nonzero_returncode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ruff")
+def test_format_python_nonzero_returncode(monkeypatch: pytest.MonkeyPatch, stub_ruff: None) -> None:
 
     def fake_run(args: list[str], **kwargs: object) -> _Completed:
         return _Completed(1)
@@ -39,9 +37,9 @@ def test_format_python_nonzero_returncode(monkeypatch: pytest.MonkeyPatch) -> No
         format_python("x = 1\n")
 
 
-def test_format_path_check_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ruff")
-
+def test_format_path_check_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stub_ruff: None
+) -> None:
     def fake_run(args: list[str], **kwargs: object) -> _Completed:
         # returncode 2 from ``ruff check`` is neither clean (0) nor lint-only (1)
         return _Completed(2 if "check" in args else 0)
@@ -51,9 +49,9 @@ def test_format_path_check_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         format_path(tmp_path / "f.py")
 
 
-def test_format_path_format_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/ruff")
-
+def test_format_path_format_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stub_ruff: None
+) -> None:
     def fake_run(args: list[str], **kwargs: object) -> _Completed:
         # check passes (1 == remaining lint findings, tolerated); format then fails
         return _Completed(1 if "check" in args else 3)

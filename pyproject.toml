@@ -44,14 +44,18 @@ dependencies = [
     "referencing>=0.35.0",
     "pydantic>=2.0.0",
     "pydantic-settings>=2.0.0",
-    # ruff is invoked at runtime to import-sort and format every generated file.
+    # Both are invoked at runtime, so they are hard requirements rather than extras:
+    # ruff import-sorts and formats every generated file, and `--check` runs both over
+    # the result. The generator resolves them from its own environment (see
+    # `tooling.py`), never from PATH, so a co-installed copy must always exist.
     "ruff>=0.6.0",
+    "mypy>=1.10.0",
 ]
 
 [project.optional-dependencies]
-# `--check` runs ruff + mypy --strict on the generated package. ruff is already a
-# core dependency, so this extra only needs to add mypy.
-check = ["mypy>=1.10.0"]
+# Retained so existing `unihttp-openapi-generator[check]` installs keep resolving;
+# mypy moved into the core dependencies, so this adds nothing.
+check = []
 
 [project.scripts]
 unihttp-openapi-generator = "unihttp_openapi_generator.cli:app"

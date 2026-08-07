@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
+
+from unihttp_openapi_generator.tooling import ruff_executable
+
+
+@pytest.fixture(autouse=True)
+def _reset_tool_lookup_cache() -> Iterator[None]:
+    """Keep a monkeypatched ruff lookup in one test from leaking into the next."""
+    ruff_executable.cache_clear()
+    yield
+    ruff_executable.cache_clear()
 
 
 @pytest.fixture
