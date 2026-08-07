@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -113,6 +114,12 @@ class IRBuilder:
         self._root_uri = root_uri
         self._omit_optionals = omit_optionals
         self._inheritance = inheritance
+        # Wire names a model listed in its own ``required``, keyed by ``id(model)``.
+        # Under inheritance a subtype routinely tightens a base property by naming it
+        # in ``required`` without restating the property, and nothing in ``fields``
+        # records that; ``_restore_required_narrowing`` replays it once the base chain
+        # is known. Keyed by identity because it is builder bookkeeping, not IR.
+        self._own_required: dict[int, set[str]] = {}
         self._strip_segments = self._resolve_strip_segments(strip_prefix)
         self._declarations: dict[str, Declaration] = {}
         # one registry for all top-level class names (models, enums, aliases, method
@@ -171,6 +178,7 @@ class IRBuilder:
         ordered: list[Declaration] = []
         done: set[str] = set()
         on_stack: set[str] = set()
+        broken: list[tuple[IRModel, str]] = []
 
         def visit(decl: Declaration) -> None:
             if decl.name in done:
@@ -183,10 +191,13 @@ class IRBuilder:
             if base is not None and base in by_name:
                 if base in on_stack:
                     logger.warning(
-                        "inheritance cycle at %r -> %r; dropping the base class", decl.name, base
+                        "inheritance cycle at %r -> %r; merging the base in instead",
+                        decl.name,
+                        base,
                     )
                     assert isinstance(decl, IRModel)
                     decl.base_model = None
+                    broken.append((decl, base))
                 else:
                     visit(by_name[base])
             on_stack.discard(decl.name)
@@ -195,7 +206,31 @@ class IRBuilder:
 
         for decl in declarations:
             visit(decl)
+        # After the walk, so every ``base_model`` the merge reads is already final.
+        for orphan, dropped in broken:
+            self._merge_dropped_base(orphan, by_name, dropped)
         return ordered
+
+    def _merge_dropped_base(
+        self, model: IRModel, by_name: dict[str, Declaration], base: str
+    ) -> None:
+        """Copy a dropped base's fields back in, so breaking a cycle loses no data.
+
+        Clearing ``base_model`` alone leaves the model with nothing but the properties
+        it declared itself, and every field it used to inherit disappears from the
+        output. Merge mode flattens the very same cycle and keeps them, so this is the
+        one place inheritance mode would decode strictly less than the default.
+        """
+        own = {f.wire_name for f in model.fields}
+        used = NameRegistry()
+        for f in model.fields:
+            used.reserve(f.name)
+        for wire, inherited_field in self._inherited_fields(by_name, base).items():
+            if wire in own:
+                continue
+            copied = replace(inherited_field)
+            copied.name = used.reserve(inherited_field.name)
+            model.fields.append(copied)
 
     def _reconcile_inheritance(self, declarations: list[Declaration]) -> None:
         """Make every subclass agree with its base chain (inheritance mode only).
@@ -213,9 +248,68 @@ class IRBuilder:
         for decl in declarations:
             if isinstance(decl, IRModel) and decl.base_model is not None:
                 inherited = self._inherited_fields(by_name, decl.base_model)
+                self._restore_required_narrowing(decl, inherited)
+                self._retype_discriminator_tag(decl, inherited, by_name)
                 self._drop_unsafe_overrides(decl, inherited)
                 self._rename_shadowed_fields(decl, inherited)
                 self._align_override_names(decl, inherited)
+
+    def _restore_required_narrowing(self, model: IRModel, inherited: dict[str, IRField]) -> None:
+        """Re-declare an inherited field the subtype narrows only via ``required``.
+
+        Naming a base property in the subtype's ``required`` without restating the
+        property is the ordinary way a spec tightens a base. Merge mode picks the
+        stronger requiredness up for free, because there is one merged property; under
+        inheritance the property stays on the base and nothing carried the tightening
+        down, so a spec-required field silently kept the base's ``T | None = None``.
+
+        The re-declaration keeps the base's *annotation* and only drops the default:
+        an optional field is rendered ``T | None`` whether it is optional or genuinely
+        nullable, and the IR no longer distinguishes the two, so narrowing to ``T``
+        could reject a null the spec allows. Same annotation is always a legal
+        override, and ``_drop_unsafe_overrides`` keeps it because requiredness differs.
+        """
+        own = {f.wire_name for f in model.fields}
+        for wire in sorted(self._own_required.get(id(model), set())):
+            base_field = inherited.get(wire)
+            if wire in own or base_field is None or base_field.required:
+                continue
+            model.fields.append(
+                replace(base_field, required=True, default=None, has_default=False, omittable=False)
+            )
+
+    @staticmethod
+    def _retype_discriminator_tag(
+        model: IRModel, inherited: dict[str, IRField], by_name: dict[str, Declaration]
+    ) -> None:
+        """Pin an enum-typed discriminator tag as the enum member instead of a Literal.
+
+        The idiomatic OpenAPI form types the discriminator property as a ``$ref`` to an
+        enum. ``Literal['callback']`` is not assignable to ``ButtonKind``, so the tag
+        used to be dropped as an unsound override and the subtype ended up with no
+        pinned tag at all: constructible with any sibling's tag, and encoded without one
+        unless the caller remembered to pass it. Re-typing it to the enum the base
+        declares keeps the annotation identical, so it survives as a legal override that
+        changes only the default.
+        """
+        for f in model.fields:
+            if not (isinstance(f.type, LiteralType) and len(f.type.values) == 1 and f.has_default):
+                continue
+            base_field = inherited.get(f.wire_name)
+            if base_field is None:
+                continue
+            declared = base_field.type
+            target = declared.inner if isinstance(declared, OptionalType) else declared
+            if not isinstance(target, RefType):
+                continue
+            enum_decl = by_name.get(target.name)
+            if not isinstance(enum_decl, IREnum):
+                continue
+            member = next((m for m, value in enum_decl.members if value == f.default), None)
+            if member is None:
+                continue
+            f.type = declared
+            f.default_expr = f"{enum_decl.name}.{member}"
 
     @staticmethod
     def _inherited_fields(by_name: dict[str, Declaration], base: str) -> dict[str, IRField]:
@@ -417,13 +511,13 @@ class IRBuilder:
             return
         disc_raw = schema.get("discriminator")
         if isinstance(disc_raw, dict) and isinstance(disc_raw.get("mapping"), dict):
-            # ``_is_object`` is the load-bearing guard: only a base that declares its
-            # own structure can *be* a class. The common OpenAPI idiom puts the
-            # discriminator on a bare ``oneOf`` holder that has no properties of its
+            # ``_has_own_structure`` is the load-bearing guard: only a base that
+            # declares its own fields can *be* a class. The common OpenAPI idiom puts
+            # the discriminator on a bare ``oneOf`` holder with no properties of its
             # own -- turning that into a class would emit an empty ``class Base: pass``
             # and silently swallow every payload annotated with it, so it stays a union
             # alias even in inheritance mode.
-            if self._inheritance and self._is_object(schema):
+            if self._inheritance and self._has_own_structure(schema):
                 # The base keeps its own properties and stays a class; subtypes
                 # inherit from it instead of being folded into a union alias. It is
                 # declared *before* they are converted, so their own `_build_object`
@@ -528,6 +622,20 @@ class IRBuilder:
         if IRBuilder._singleton_allof_ref(schema) is not None:
             return False
         return "properties" in schema or "allOf" in schema
+
+    @staticmethod
+    def _has_own_structure(schema: dict[str, Any]) -> bool:
+        """Whether the schema declares fields of its own, not merely the *keys* for them.
+
+        Stricter than ``_is_object`` on purpose. Key presence is the right test for
+        "model class vs ``dict[str, Any]``", but not for "may this be a base class":
+        plenty of generators emit a bare discriminator holder as ``properties: {}``,
+        which passes ``_is_object`` and would become an empty ``class Base: pass``
+        that every payload annotated with it decodes into, losing all of its fields.
+        """
+        if IRBuilder._singleton_allof_ref(schema) is not None:
+            return False
+        return bool(schema.get("properties")) or bool(schema.get("allOf"))
 
     @staticmethod
     def _split_nullable(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -760,7 +868,7 @@ class IRBuilder:
             return False
         disc = schema.get("discriminator")
         if isinstance(disc, dict) and isinstance(disc.get("mapping"), dict):
-            return self._inheritance and self._is_object(schema)
+            return self._inheritance and self._has_own_structure(schema)
         if is_disc_subtype and "allOf" in schema:
             return True
         return self._is_object(schema)
@@ -785,7 +893,10 @@ class IRBuilder:
             f.name = field_names.reserve(f.name)  # distinct wire names can collapse (e.g. +1/-1)
             model.fields.append(f)
         # Overrides are reconciled against the full base chain once the graph is
-        # complete; see ``_reconcile_inheritance``.
+        # complete; see ``_reconcile_inheritance``. ``required`` has to be carried
+        # over separately: a subtype that only tightens an inherited property names it
+        # here and contributes no property of its own.
+        self._own_required[id(model)] = set(required)
         if isinstance(additional, dict):
             model.additional_properties = self._convert(additional, base_uri, name + "Value")
         elif additional is True:
@@ -814,27 +925,50 @@ class IRBuilder:
                 kept.append(f)
                 continue
             # Same annotation is always a legal override, so a restatement survives
-            # when it carries a default the base does not - dropping it would silently
-            # replace the value the spec asked for with the base's.
-            if f.type.annotation() == base_field.type.annotation() and self._overrides_default(
-                f, base_field
-            ):
+            # whenever it carries something the base does not.
+            if f.type.annotation() == base_field.type.annotation() and self._refines(f, base_field):
                 kept.append(f)
                 continue
-            logger.debug(
-                "%s.%s re-declares %s incompatibly (%s vs %s); inheriting instead",
-                model.name,
-                f.name,
-                f.wire_name,
-                f.type.annotation(),
-                base_field.type.annotation(),
-            )
+            if f.type.annotation() == base_field.type.annotation():
+                # A verbatim restatement (spec prose, usually): the base's declaration
+                # already says everything this one does, so nothing is lost by
+                # inheriting it and there is nothing for the user to act on.
+                logger.debug(
+                    "%s.%s restates inherited %s verbatim; inheriting instead",
+                    model.name,
+                    f.name,
+                    f.wire_name,
+                )
+            else:
+                # This one *does* lose information -- the subtype asked for a type the
+                # base does not admit, and the generated client will use the base's.
+                logger.warning(
+                    "%s.%s re-declares %s incompatibly (%s vs %s); inheriting instead",
+                    model.name,
+                    f.name,
+                    f.wire_name,
+                    f.type.annotation(),
+                    base_field.type.annotation(),
+                )
         model.fields = kept
 
     @staticmethod
-    def _overrides_default(sub: IRField, base: IRField) -> bool:
-        """Whether ``sub`` restates an inherited field to change its default value."""
-        return sub.has_default and (not base.has_default or sub.default != base.default)
+    def _refines(sub: IRField, base: IRField) -> bool:
+        """Whether a same-annotation restatement carries something the base lacks.
+
+        An identical annotation is always a legal override, so the only question is
+        whether re-emitting it changes anything:
+
+        - a different ``default`` -- dropping it hands the subtype the base's value;
+        - different ``constraints`` -- ``maxLength``/``pattern``/``minimum`` are
+          enforced by every serializer, so losing them makes the generated client
+          accept payloads the API will reject;
+        - stricter requiredness -- see ``_restore_required_narrowing``.
+        """
+        changes_default = sub.has_default and (not base.has_default or sub.default != base.default)
+        return (
+            changes_default or sub.constraints != base.constraints or sub.required != base.required
+        )
 
     @staticmethod
     def _rename_shadowed_fields(model: IRModel, inherited: dict[str, IRField]) -> None:
@@ -889,6 +1023,9 @@ class IRBuilder:
             return False  # a pure restatement: nothing to gain, just inherit it
         if isinstance(base, PrimitiveType) and base.py == "Any":
             return True
+        if isinstance(sub, OptionalType) and isinstance(base, OptionalType):
+            # ``T | None`` narrows ``U | None`` exactly when ``T`` narrows ``U``.
+            return cls._is_narrowing(sub.inner, base.inner)
         if isinstance(base, OptionalType):
             # ``T | None`` admits ``T`` and anything that narrows ``T``.
             return sub.annotation() == base.inner.annotation() or cls._is_narrowing(sub, base.inner)
@@ -899,12 +1036,26 @@ class IRBuilder:
             # wider Literal that already admits every value.
             if isinstance(base, LiteralType):
                 return set(sub.values) <= set(base.values)
-            return isinstance(base, PrimitiveType) and base.py in ("str", "int", "bool")
+            # The values' own python types have to match too: ``Literal['one', 'two']``
+            # over an ``int`` base is an ``[assignment]`` error under ``mypy --strict``,
+            # and the base being *some* scalar says nothing about which one.
+            return isinstance(base, PrimitiveType) and cls._literals_fit(sub.values, base.py)
         if isinstance(base, UnionType):
             return any(
                 cls._is_narrowing(sub, m) or sub.annotation() == m.annotation()
                 for m in base.members
             )
+        return False
+
+    @staticmethod
+    def _literals_fit(values: tuple[str | int | bool, ...], py: str) -> bool:
+        """Whether every literal value is an instance of the base's primitive type."""
+        if py == "bool":
+            return all(isinstance(v, bool) for v in values)
+        if py == "int":
+            return all(isinstance(v, int) and not isinstance(v, bool) for v in values)
+        if py == "str":
+            return all(isinstance(v, str) for v in values)
         return False
 
     @staticmethod

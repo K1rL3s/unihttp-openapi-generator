@@ -176,3 +176,99 @@ def test_cyclic_models_round_trip_per_object(serializer: Serializer, tmp_path: P
     finally:
         sys.path.remove(str(out))
         _drop(package)
+
+
+def _enum_tag_spec() -> dict[str, Any]:
+    """A hierarchy whose discriminator property is typed as a ``$ref`` to an enum."""
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Tagged", "version": "1.0.0"},
+        "servers": [{"url": "https://api.example.com"}],
+        "paths": {
+            "/b": {
+                "get": {
+                    "operationId": "getButton",
+                    "tags": ["buttons"],
+                    "responses": {
+                        "200": {
+                            "description": "ok",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/CallbackButton"}
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        },
+        "components": {
+            "schemas": {
+                "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+                "Button": {
+                    "type": "object",
+                    "required": ["type", "text"],
+                    "properties": {
+                        "type": {"$ref": "#/components/schemas/ButtonKind"},
+                        "text": {"type": "string"},
+                    },
+                    "discriminator": {
+                        "propertyName": "type",
+                        "mapping": {
+                            "callback": "#/components/schemas/CallbackButton",
+                            "link": "#/components/schemas/LinkButton",
+                        },
+                    },
+                },
+                "CallbackButton": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Button"},
+                        {"required": ["payload"], "properties": {"payload": {"type": "string"}}},
+                    ]
+                },
+                "LinkButton": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/Button"},
+                        {"required": ["url"], "properties": {"url": {"type": "string"}}},
+                    ]
+                },
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize("serializer", _SERIALIZERS)
+def test_pinned_enum_default_is_imported_at_runtime(serializer: Serializer, tmp_path: Path) -> None:
+    """``type: ButtonKind = ButtonKind.CALLBACK`` evaluates when the module is imported.
+
+    A base class and a class named in a default expression are the two references that
+    cannot be deferred into the ``TYPE_CHECKING`` block. Neither ruff nor mypy notices
+    the difference -- a deferred enum only fails at import time, with a ``NameError``.
+    """
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(_enum_tag_spec()))
+    out = tmp_path / f"out_{serializer.value}"
+    package = f"tagged_{serializer.value}"
+    run_generation(
+        str(spec_file),
+        GeneratorConfig(
+            package_name=package,
+            output_dir=out,
+            serializer=serializer,
+            file_layout=FileLayout.PER_OBJECT,
+            inheritance=True,
+        ),
+    )
+    subtype = (out / package / "models" / "callback_button.py").read_text()
+    assert f"from {package}.models.button_kind import ButtonKind" in subtype
+    assert "TYPE_CHECKING" not in subtype
+
+    sys.path.insert(0, str(out))
+    try:
+        _import_clean(package)
+        models = importlib.import_module(f"{package}.models")
+        button = models.CallbackButton(text="t", payload="p")
+        assert button.type is models.ButtonKind.CALLBACK
+    finally:
+        sys.path.remove(str(out))
+        _drop(package)

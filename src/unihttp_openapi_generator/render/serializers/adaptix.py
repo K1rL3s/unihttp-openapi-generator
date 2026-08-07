@@ -6,13 +6,13 @@ from typing import Any
 
 from unihttp_openapi_generator.config import Serializer
 from unihttp_openapi_generator.ir.document import IRDocument
-from unihttp_openapi_generator.ir.models import Declaration, IRModel
+from unihttp_openapi_generator.ir.models import Declaration, IRField, IRModel
 from unihttp_openapi_generator.ir.operations import IROperation, ParamLocation
 from unihttp_openapi_generator.ir.types import Import, ListType, OptionalType
 from unihttp_openapi_generator.render.serializers.base import (
     SerializerStrategy,
+    default_source,
     docstring,
-    literal_repr,
 )
 
 
@@ -57,10 +57,10 @@ class AdaptixStrategy(SerializerStrategy):
         return "\n".join(lines)
 
     @staticmethod
-    def _default_repr(value: Any) -> str:
-        if isinstance(value, list | dict):
-            return f"dataclasses.field(default_factory=lambda: {value!r})"
-        return literal_repr(value)
+    def _default_repr(field_obj: IRField) -> str:
+        if isinstance(field_obj.default, list | dict):
+            return f"dataclasses.field(default_factory=lambda: {field_obj.default!r})"
+        return default_source(field_obj)
 
     def _field_line(self, name: str, annotation: str, field_obj: Any) -> str:
         # NOTE: adaptix has no built-in runtime constraint enforcement equivalent to
@@ -70,7 +70,7 @@ class AdaptixStrategy(SerializerStrategy):
             return f"{name}: Omittable[{annotation}] = Omitted()"
         if not field_obj.has_default:
             return f"{name}: {annotation}"
-        return f"{name}: {annotation} = {self._default_repr(field_obj.default)}"
+        return f"{name}: {annotation} = {self._default_repr(field_obj)}"
 
     @staticmethod
     def _operation_alias_map(op: IROperation) -> dict[str, str]:

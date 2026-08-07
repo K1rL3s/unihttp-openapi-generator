@@ -1050,13 +1050,15 @@ def test_inheritance_tag_field_never_collides_with_a_sibling() -> None:
     assert sibling.needs_alias is True  # renamed, so the wire name is restored by an alias
 
 
-def test_inheritance_tag_not_pinned_over_an_enum_typed_property() -> None:
-    """The pinned tag is an override like any other, so it obeys the narrowing rule.
+def test_inheritance_tag_is_pinned_as_the_enum_member_the_base_declares() -> None:
+    """A base that types the tag as a ``$ref`` to an enum still gets its tag pinned.
 
-    A base that types the discriminator property as a ``$ref`` to an enum is the
-    idiomatic OpenAPI form, and ``Literal['callback']`` is not assignable to that enum:
-    ``mypy --strict`` rejects the subclass outright. The subtype inherits the base's
-    declaration instead of emitting an unsound override.
+    That is the idiomatic OpenAPI form, and ``Literal['callback']`` is not assignable
+    to the enum: emitting it fails ``mypy --strict``. Dropping the tag instead is worse
+    than it sounds -- the subtype is then constructible with any sibling's tag, and
+    encodes without one unless the caller passes it. Re-typing the tag to the enum and
+    pinning the matching *member* keeps the base's annotation, so it survives as an
+    override that changes nothing but the default.
     """
     spec: dict[str, Any] = {
         "openapi": "3.1.0",
@@ -1090,11 +1092,15 @@ def test_inheritance_tag_not_pinned_over_an_enum_typed_property() -> None:
     ir = build_ir(spec, RefResolver(spec), inheritance=True)
     sub = _decl(ir, "CallbackButton")
     assert sub.base_model == "Button"
-    assert [f.name for f in sub.fields] == ["payload"]
+    assert [f.name for f in sub.fields] == ["type", "payload"]
+    tag = sub.fields[0]
+    # the base's annotation, so mypy sees a legal override; the member as the default
+    assert tag.type.annotation() == "ButtonKind"
+    assert tag.default_expr == "ButtonKind.CALLBACK"
+    assert tag.has_default is True
     marker = _decl(ir, "LinkButton")
     assert marker.base_model == "Button"
-    assert marker.fields == []
-    # the base keeps the enum-typed property, so the tag is not lost -- only unpinned
+    assert [f.default_expr for f in marker.fields] == ["ButtonKind.LINK"]
     base = _decl(ir, "Button")
     assert [f.type.annotation() for f in base.fields] == ["ButtonKind"]
 
@@ -1270,3 +1276,178 @@ def test_allof_cycle_terminates_instead_of_recursing() -> None:
     for name, base in bases.items():
         if base is not None:
             assert names.index(base) < names.index(name)
+
+
+def _hier(schemas: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "S", "version": "1.0.0"},
+        "paths": {},
+        "components": {"schemas": schemas},
+    }
+
+
+def test_inheritance_literal_over_a_mismatched_primitive_is_not_a_narrowing() -> None:
+    """``Literal['one', 'two']`` does not narrow an ``int`` base, whatever the shape.
+
+    Knowing the base is *some* scalar says nothing about which one, so accepting every
+    ``Literal`` over ``str``/``int``/``bool`` emitted ``class C(P): k: Literal['one',
+    'two']`` over ``k: int`` -- an ``[assignment]`` error that made ``--inheritance
+    --check`` fail on an ordinary spec.
+    """
+    spec = _hier(
+        {
+            "P": {"type": "object", "required": ["k"], "properties": {"k": {"type": "integer"}}},
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {"required": ["k"], "properties": {"k": {"enum": ["one", "two"]}}},
+                ]
+            },
+        }
+    )
+    sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "C")
+    assert sub.base_model == "P"
+    assert sub.fields == []  # dropped as unsound; the int declaration is inherited
+
+    # the same restatement over a ``str`` base *is* a genuine narrowing and stays
+    spec["components"]["schemas"]["P"]["properties"]["k"] = {"type": "string"}
+    kept = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "C")
+    assert [f.type.annotation() for f in kept.fields] == ["Literal['one', 'two']"]
+
+
+def test_inheritance_carries_a_required_only_tightening_down() -> None:
+    """Naming a base property in ``required`` without restating it must still tighten it.
+
+    The subtype contributes no property of its own here, so nothing used to reach the
+    subclass and a spec-required field silently kept the base's optional declaration.
+    """
+    spec = _hier(
+        {
+            "P": {"type": "object", "properties": {"v": {"type": "string"}}},
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {
+                        "type": "object",
+                        "required": ["v"],
+                        "properties": {"c": {"type": "string"}},
+                    },
+                ]
+            },
+        }
+    )
+    sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "C")
+    v = next(f for f in sub.fields if f.wire_name == "v")
+    assert v.required is True
+    assert v.has_default is False
+    # the annotation is the base's: the IR cannot tell "optional" from "nullable", and
+    # narrowing to ``str`` would reject a null the spec may well allow
+    assert v.type.annotation() == "str | None"
+
+
+def test_inheritance_keeps_a_restatement_that_only_adds_constraints() -> None:
+    """``Annotated[str, Meta(max_length=8)]`` over ``str`` is a legal override.
+
+    Comparing annotations alone dropped it, so the generated client stopped enforcing
+    the constraints the spec mandates and accepted payloads the API rejects.
+    """
+    spec = _hier(
+        {
+            "P": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            },
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {
+                        "required": ["name"],
+                        "properties": {
+                            "name": {"type": "string", "maxLength": 8, "pattern": "^[a-z]+$"}
+                        },
+                    },
+                ]
+            },
+        }
+    )
+    sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "C")
+    assert [f.constraints for f in sub.fields] == [{"maxLength": 8, "pattern": "^[a-z]+$"}]
+
+
+def test_inheritance_empty_properties_holder_stays_a_union_alias() -> None:
+    """``properties: {}`` is not "declares its own structure".
+
+    Testing key presence let a bare discriminator holder become an empty
+    ``class Shape: pass`` that every payload annotated with it decoded into, losing
+    every field of the concrete variant.
+    """
+    spec = _hier(
+        {
+            "Shape": {
+                "type": "object",
+                "properties": {},
+                "discriminator": {
+                    "propertyName": "kind",
+                    "mapping": {
+                        "circle": "#/components/schemas/Circle",
+                        "square": "#/components/schemas/Square",
+                    },
+                },
+            },
+            "Circle": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Shape"},
+                    {
+                        "required": ["kind", "r"],
+                        "properties": {"kind": {"type": "string"}, "r": {"type": "number"}},
+                    },
+                ]
+            },
+            "Square": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Shape"},
+                    {
+                        "required": ["kind", "side"],
+                        "properties": {"kind": {"type": "string"}, "side": {"type": "number"}},
+                    },
+                ]
+            },
+        }
+    )
+    shape = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "Shape")
+    assert isinstance(shape, IRAlias)
+    assert shape.target.annotation() == "Circle | Square"
+
+
+def test_allof_cycle_merges_the_dropped_base_instead_of_losing_its_fields() -> None:
+    """Breaking an inheritance cycle must not cost the model its inherited fields.
+
+    ``_ordered_declarations`` clears ``base_model`` to keep the emitted classes
+    resolvable; without merging the base back in, the orphaned end kept only the
+    properties it declared itself and decoded strictly less than merge mode does.
+    """
+    spec = _hier(
+        {
+            "X": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Y"},
+                    {"properties": {"x": {"type": "string"}}},
+                ]
+            },
+            "Y": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/X"},
+                    {"properties": {"y": {"type": "string"}}},
+                ]
+            },
+        }
+    )
+    merged = build_ir(spec, RefResolver(spec))
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    orphan = next(d for d in ir.declarations if isinstance(d, IRModel) and d.base_model is None)
+    # whichever end lost its base edge still reaches every wire key merge mode has
+    assert {f.wire_name for f in orphan.fields} == {
+        f.wire_name for f in _decl(merged, orphan.name).fields
+    }

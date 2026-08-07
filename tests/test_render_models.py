@@ -437,3 +437,113 @@ def test_discriminated_base_class_keeps_its_mapping_visible() -> None:
     ir = build_ir(_INHERITED_SPEC, RefResolver(_INHERITED_SPEC), inheritance=True)
     source = render_models_module(ir, get_strategy(Serializer.ADAPTIX))
     assert "# discriminator: type (callback=CallbackButton)" in source
+
+
+# -- review fixes: discriminator comment, docstring width, enum-typed tag ------
+
+
+_MAPPINGLESS_DISCRIMINATOR: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "Pet": {
+                "type": "object",
+                "required": ["petType", "name"],
+                "properties": {"petType": {"type": "string"}, "name": {"type": "string"}},
+                "discriminator": {"propertyName": "petType"},
+            }
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_mappingless_discriminator_emits_no_comment(serializer: Serializer) -> None:
+    """A concrete model that merely names a discriminator property is not a union base.
+
+    ``Pet`` has no subtypes and an empty mapping, so the note would be factually wrong
+    -- and it is emitted in the default merge mode, i.e. for users who never asked for
+    ``--inheritance`` and whose output would change on the next regeneration.
+    """
+    source = _render(_MAPPINGLESS_DISCRIMINATOR, serializer)
+    assert "# discriminator" not in source
+
+
+def test_docstring_wraps_inside_the_line_budget() -> None:
+    """The opening quotes share the first line, so they come out of its budget.
+
+    Ignoring them let the first line run three columns past the limit the wrapper is
+    supposed to enforce.
+    """
+    from unihttp_openapi_generator.render.serializers.base import _DOCSTRING_LINE_LENGTH, docstring
+
+    prose = (
+        "The user's display name, which is a fairly long description intended to wrap "
+        "across more than one rendered line without going over the budget."
+    )
+    for indent in ("", "    ", "        "):
+        rendered = docstring(prose, indent)
+        too_long = [line for line in rendered.splitlines() if len(line) > _DOCSTRING_LINE_LENGTH]
+        assert too_long == [], (indent, too_long)
+
+
+_ENUM_TAG_SPEC: dict[str, Any] = {
+    "openapi": "3.1.0",
+    "info": {"title": "S", "version": "1.0.0"},
+    "paths": {},
+    "components": {
+        "schemas": {
+            "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+            "Button": {
+                "type": "object",
+                "required": ["type", "text"],
+                "properties": {
+                    "type": {"$ref": "#/components/schemas/ButtonKind"},
+                    "text": {"type": "string"},
+                },
+                "discriminator": {
+                    "propertyName": "type",
+                    "mapping": {
+                        "callback": "#/components/schemas/CallbackButton",
+                        "link": "#/components/schemas/LinkButton",
+                    },
+                },
+            },
+            "CallbackButton": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Button"},
+                    {"required": ["payload"], "properties": {"payload": {"type": "string"}}},
+                ]
+            },
+            "LinkButton": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Button"},
+                    {"required": ["url"], "properties": {"url": {"type": "string"}}},
+                ]
+            },
+        }
+    },
+}
+
+
+@pytest.mark.parametrize("serializer", list(Serializer))
+def test_enum_typed_tag_is_pinned_to_the_enum_member(
+    serializer: Serializer, tmp_path: Path
+) -> None:
+    """The subtype defaults its own tag, and the value survives a round trip.
+
+    Without the pin the subtype is constructible with a sibling's tag and encodes
+    without one unless the caller passes it by hand.
+    """
+    strategy = get_strategy(serializer)
+    doc = build_ir(_ENUM_TAG_SPEC, RefResolver(_ENUM_TAG_SPEC), inheritance=True)
+    strategy.bind_document(doc)
+    source = format_python(render_models_module(doc, strategy))
+    assert "ButtonKind.CALLBACK" in source
+    assert "ButtonKind.LINK" in source
+
+    module = _load(source, tmp_path, f"enumtag_{serializer.value}")
+    button = module.CallbackButton(text="t", payload="p")
+    assert button.type is module.ButtonKind.CALLBACK

@@ -11,6 +11,7 @@ from unihttp_openapi_generator.ir.naming import field_name
 from unihttp_openapi_generator.ir.types import Import, LiteralType, RefType, UnionType
 from unihttp_openapi_generator.render.serializers.base import (
     SerializerStrategy,
+    default_source,
     docstring,
     literal_repr,
 )
@@ -176,21 +177,21 @@ class PydanticStrategy(SerializerStrategy):
                 args.append(f"{pyd_key}={literal_repr(f.constraints[key])}")
 
         if f.has_default:
-            default = self._default_arg(f.default)
+            default = self._default_arg(f)
             if args:
                 return f"{py_name}: {annotation} = pydantic.Field({default}, {', '.join(args)})"
             if isinstance(f.default, list | dict):
                 return f"{py_name}: {annotation} = pydantic.Field({default})"
-            return f"{py_name}: {annotation} = {literal_repr(f.default)}"
+            return f"{py_name}: {annotation} = {default_source(f)}"
         if args:
             return f"{py_name}: {annotation} = pydantic.Field({', '.join(args)})"
         return f"{py_name}: {annotation}"
 
     @staticmethod
-    def _default_arg(value: Any) -> str:
-        if isinstance(value, list | dict):
-            return f"default_factory=lambda: {value!r}"
-        return f"default={literal_repr(value)}"
+    def _default_arg(f: IRField) -> str:
+        if isinstance(f.default, list | dict):
+            return f"default_factory=lambda: {f.default!r}"
+        return f"default={default_source(f)}"
 
     def needs_model_rebuild(self) -> bool:
         return True

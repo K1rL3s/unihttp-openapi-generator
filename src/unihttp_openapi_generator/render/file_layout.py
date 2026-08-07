@@ -83,9 +83,10 @@ def render_declaration_module(
 ) -> str:
     """Render a single ``models/<stem>.py`` module for one declaration.
 
-    A parent model appears in the ``class Sub(Base)`` statement, which is evaluated
-    at definition time, so it is imported at runtime; every other model reference
-    lives only inside annotations and stays deferred.
+    A parent model appears in the ``class Sub(Base)`` statement and an enum appears in
+    a pinned default -- both are evaluated at definition time, so they are imported at
+    runtime; every other model reference lives only inside annotations and stays
+    deferred.
     """
     imports = set(strategy.declaration_imports(decl))
     refs = decl.referenced_models()
@@ -93,10 +94,10 @@ def render_declaration_module(
     # TYPE_CHECKING block (and ``from __future__ import annotations`` keeps the
     # annotations lazy). Stdlib/typing/serializer imports stay at runtime.
     imports = {imp for imp in imports if imp.name not in plan.model_modules}
-    base = decl.base_model if isinstance(decl, IRModel) else None
-    if base is not None and base in plan.model_modules:
-        imports.add(Import(plan.model_dotted(package, base), base))
-        refs = refs - {base}
+    runtime = decl.runtime_refs() if isinstance(decl, IRModel) else set()
+    for name in sorted(runtime & plan.model_modules.keys()):
+        imports.add(Import(plan.model_dotted(package, name), name))
+    refs = refs - runtime
     body = strategy.render_declaration(decl)
     tc_lines = _type_checking_block(package, plan, refs)
     if tc_lines:

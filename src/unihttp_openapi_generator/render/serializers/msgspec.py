@@ -10,6 +10,7 @@ from unihttp_openapi_generator.ir.models import Declaration, IRField, IRModel
 from unihttp_openapi_generator.ir.types import Import
 from unihttp_openapi_generator.render.serializers.base import (
     SerializerStrategy,
+    default_source,
     docstring,
     literal_repr,
 )
@@ -92,7 +93,7 @@ class MsgspecStrategy(SerializerStrategy):
             if isinstance(f.default, list | dict):
                 args.append(f"default_factory=lambda: {f.default!r}")
             else:
-                args.append(f"default={literal_repr(f.default)}")
+                args.append(f"default={default_source(f)}")
         if args:
             return f"{f.name}: {annotation} = msgspec.field({', '.join(args)})"
         return f"{f.name}: {annotation}"

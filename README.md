@@ -381,9 +381,10 @@ What to do with `allOf: [{$ref: Base}, ...]`.
   - Only an `allOf` with exactly **one** `$ref` maps onto a base class — several refs
     are mixin-style composition with no single parent to pick, so those keep the merge
     behaviour. So does a `$ref` to an enum or a non-object schema.
-  - Only a base that declares **its own properties** becomes a class. The usual
-    polymorphism idiom puts the discriminator on a bare `oneOf` holder that has no
-    properties at all; there is nothing to inherit from it, so it stays a union alias
+  - Only a base that declares **at least one property of its own** becomes a class. The
+    usual polymorphism idiom puts the discriminator on a bare `oneOf` holder with no
+    properties (written either as no `properties` key or as an empty `properties: {}`);
+    there is nothing to inherit from it, so it stays a union alias
     (`type Button = CallbackButton | LinkButton`) and keeps decoding into the concrete
     variant. `--inheritance` only changes how the subtypes get *their* shared fields.
   - Constructors become keyword-only **for the models in a hierarchy** — a subclass may
@@ -391,12 +392,21 @@ What to do with `allOf: [{$ref: Base}, ...]`.
     positional ordering cannot express. Models outside every hierarchy are untouched.
   - A subtype that restates an inherited property just to attach prose, or to relax it
     to nullable, simply **inherits** it: re-declaring `v: str | None` over the base's
-    `v: str` is rejected by `mypy --strict`. Genuine narrowings (a `Literal` tag over a
-    `str`) are kept, as is a restatement that changes the `default`.
-  - The pinned discriminator tag follows the same rule. If the base types the
-    discriminator property as an enum (`type: {$ref: ButtonKind}`), `Literal['callback']`
-    is not assignable to it, so the subtype inherits `type: ButtonKind` and the tag is
-    not pinned — the class still decodes, it just no longer defaults its own tag.
+    `v: str` is rejected by `mypy --strict`. Genuine narrowings are kept — including a
+    `Literal` tag over a `str` base, but not over a base of a different scalar type
+    (`Literal['one', 'two']` does not narrow an `int`). So is a restatement that changes
+    the `default`, tightens the `constraints`, or makes the field `required`.
+  - Naming an inherited property in the subtype's `required` **without** restating the
+    property still tightens it: the subtype re-declares it with the base's annotation
+    and no default, so the constructor demands it.
+  - The discriminator tag is pinned even when the base types the property as an enum
+    (`type: {$ref: ButtonKind}`) — the idiomatic form. `Literal['callback']` is not
+    assignable to `ButtonKind`, so the subtype pins the matching **member** instead:
+    ```python
+    class CallbackButton(Button):
+        type: ButtonKind = ButtonKind.CALLBACK
+        payload: str
+    ```
   - Two properties whose names collapse onto one Python identifier (`packSize` on the
     base, `pack_size` on the subtype) stay separate fields: the subtype's is renamed and
     aliased back to its wire name rather than shadowing the inherited one.

@@ -14,6 +14,7 @@ from unihttp_openapi_generator.ir.models import (
     Discriminator,
     IRAlias,
     IREnum,
+    IRField,
     IRModel,
 )
 from unihttp_openapi_generator.ir.types import Import
@@ -26,6 +27,17 @@ _DOCSTRING_LINE_LENGTH = 88
 
 def literal_repr(value: Any) -> str:
     return repr(value)
+
+
+def default_source(f: IRField) -> str:
+    """Python source for a field's default value.
+
+    ``IRField.default_expr`` wins when set: an enum-typed discriminator tag has to be
+    written as ``ButtonKind.CALLBACK``, which ``repr`` of the underlying ``'callback'``
+    cannot produce. Only ever a scalar, so callers keep their own list/dict
+    ``default_factory`` branch ahead of this.
+    """
+    return f.default_expr if f.default_expr is not None else literal_repr(f.default)
 
 
 def docstring(text: str | None, indent: str) -> str:
@@ -54,10 +66,20 @@ def docstring(text: str | None, indent: str) -> str:
     # ``"""`` sits on its own line, so trailing ``"``/``\`` in content is safe.
     body_width = max(_DOCSTRING_LINE_LENGTH - len(indent), 1)
     wrapped_paragraphs: list[list[str]] = []
-    for paragraph in paragraphs:
+    for index, paragraph in enumerate(paragraphs):
+        # The opening ``\"\"\"`` shares the first line of the first paragraph, so that
+        # line has ``len(prefix)`` fewer columns to play with. Budgeting it as an
+        # initial indent (stripped again below) keeps every emitted line inside the
+        # limit instead of overshooting it by exactly the quotes.
         wrapped = textwrap.wrap(
-            paragraph, width=body_width, break_long_words=False, break_on_hyphens=False
+            paragraph,
+            width=body_width,
+            initial_indent=" " * len(prefix) if index == 0 else "",
+            break_long_words=False,
+            break_on_hyphens=False,
         )
+        if index == 0 and wrapped:
+            wrapped[0] = wrapped[0][len(prefix) :]
         wrapped_paragraphs.append(wrapped or [""])
     lines: list[str] = []
     for index, wrapped in enumerate(wrapped_paragraphs):
@@ -123,11 +145,14 @@ class SerializerStrategy(ABC):
         if isinstance(decl, IRAlias):
             return self.render_alias(decl)
         body = self.render_model(decl)
-        if decl.discriminator is not None:
-            # A discriminated base kept as a class (inheritance mode). No serializer
-            # resolves a subtype from a base-class annotation on its own, so surface
-            # the mapping instead of dropping it: it is what a reader needs to wire
-            # tagged decoding by hand.
+        # A discriminated base kept as a class (inheritance mode). No serializer
+        # resolves a subtype from a base-class annotation on its own, so surface the
+        # mapping instead of dropping it: it is what a reader needs to wire tagged
+        # decoding by hand. Gated on there being something to say -- a plain object
+        # that merely declares ``discriminator: {propertyName: ...}`` with no mapping
+        # is a concrete model with no subtypes, and announcing it as a union base
+        # would be wrong as well as new output for every existing default-mode user.
+        if decl.discriminator is not None and (decl.base_model or decl.discriminator.mapping):
             body = f"{self._discriminator_comment(decl.discriminator)}\n{body}"
         return body
 
