@@ -205,7 +205,7 @@ unihttp-openapi-generator generate SPEC [options]
 | `--optional` | `none` · `omitted` (`none`) — `omitted` distinguishes absent from null (adaptix) |
 | `--strip-prefix` | `auto` or a dotted prefix to drop from schema names (e.g. `io.k8s.api.core.v1.Pod` → `CoreV1Pod`) |
 | `--inheritance` | off by default — render `allOf: [$ref]` as a base class instead of merging its fields in |
-| `--check` | run `ruff` and `mypy --strict` on the output |
+| `--check` | run `ruff` and `mypy --strict` on the output ([details](#checking-the-output--check)) |
 | `--config` | TOML config file |
 
 ### Config file
@@ -428,6 +428,26 @@ What to do with `allOf: [{$ref: Base}, ...]`.
 - Operations: path/query/header parameters with defaults, JSON/form/multipart bodies,
   file uploads, typed responses, and `deprecated`.
 - Security: apiKey, http bearer/basic, oauth2, openIdConnect.
+
+## Checking the output — `--check`
+
+`--check` runs `ruff check` and `mypy --strict` over the generated package.
+
+Both tools are ordinary dependencies of the generator, so installing it installs them —
+there is nothing extra to add. They are also resolved from the generator's *own*
+environment rather than from `PATH`, so an unrelated `ruff` or `mypy` installed
+system-wide can never take over and lint the output by different rules.
+
+One thing to know if you installed the generator standalone (`uv tool install`, `pipx`):
+`mypy --strict` has to resolve the generated code's imports — `unihttp` and your chosen
+serializer — and a standalone install has neither. Activate the project virtualenv you
+intend to install the client into before running with `--check`, and the generator points
+mypy at it. Without an activated virtualenv, `--check` from a standalone install reports
+`import-not-found`; install the generator into the project environment instead:
+
+```bash
+uv add --dev unihttp-openapi-generator
+```
 
 ## Limitations
 

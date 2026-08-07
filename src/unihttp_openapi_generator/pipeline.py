@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -12,6 +11,11 @@ from unihttp_openapi_generator.emit import write_package
 from unihttp_openapi_generator.ir.builder import build_ir
 from unihttp_openapi_generator.loader import load_spec
 from unihttp_openapi_generator.refs import RefResolver
+from unihttp_openapi_generator.tooling import (
+    mypy_command,
+    ruff_executable,
+    target_python_executable,
+)
 
 logger = logging.getLogger("unihttp_openapi_generator")
 
@@ -20,31 +24,36 @@ class CheckError(Exception):
     """Raised when ``--check`` finds problems in the generated package."""
 
 
-def _run_check(tool: str, args: list[str], package_dir: Path) -> None:
-    found = shutil.which(tool)
-    if found is None:
-        raise CheckError(f"{tool} executable not found on PATH (required by --check)")
-    result = subprocess.run([found, *args, str(package_dir)], capture_output=True, text=True)
+def _run_check(tool: str, command: list[str], package_dir: Path) -> None:
+    result = subprocess.run([*command, str(package_dir)], capture_output=True, text=True)
     if result.returncode != 0:
         raise CheckError(f"{tool} check failed for {package_dir}:\n{result.stdout}{result.stderr}")
     logger.info("%s check passed for %s", tool, package_dir)
+
+
+def _mypy_args() -> list[str]:
+    args = [
+        "--strict",
+        "--disable-error-code",
+        "no-untyped-call",
+        "--explicit-package-bases",
+    ]
+    # The generated code imports unihttp and the chosen serializer. Those resolve from
+    # the environment mypy runs in, which is the generator's -- and when the generator
+    # was installed standalone, that environment has neither. An activated virtualenv
+    # is the better answer, so hand it to mypy explicitly.
+    target = target_python_executable()
+    if target is not None:
+        args += ["--python-executable", target]
+    return args
 
 
 def _check_package(package_dir: Path) -> None:
     # Generated packages ship without a ``[tool.ruff]`` table and are meant to lint
     # under ruff's defaults; ``--isolated`` ignores any ambient config that ruff
     # would otherwise discover from the cwd/parent dirs.
-    _run_check("ruff", ["check", "--isolated"], package_dir)
-    _run_check(
-        "mypy",
-        [
-            "--strict",
-            "--disable-error-code",
-            "no-untyped-call",
-            "--explicit-package-bases",
-        ],
-        package_dir,
-    )
+    _run_check("ruff", [ruff_executable(), "check", "--isolated"], package_dir)
+    _run_check("mypy", [*mypy_command(), *_mypy_args()], package_dir)
 
 
 def run_generation(spec_source: str, config: GeneratorConfig) -> Path:
