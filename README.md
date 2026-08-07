@@ -15,6 +15,34 @@ Point it at a spec; get back an installable package with data models, request
 classes, a sync and/or async client, an exception hierarchy, and authentication
 wiring. The output is formatted with `ruff` and type-checks clean under `mypy --strict`.
 
+## Table of Contents
+
+- [Why](#why)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Alternative: the unihttp agent skills](#alternative-the-unihttp-agent-skills)
+- [What you get](#what-you-get)
+- [Using the client](#using-the-client)
+    - [Base URL and servers](#base-url-and-servers)
+    - [Authentication](#authentication)
+    - [Custom headers, cookies, timeouts](#custom-headers-cookies-timeouts)
+    - [Errors](#errors)
+    - [Middleware](#middleware)
+- [CLI options](#cli-options)
+    - [Config file](#config-file)
+- [Serializers](#serializers)
+- [Generation options](#generation-options)
+    - [Client layout — `--layout`](#client-layout----layout)
+    - [File layout — `--file-layout`](#file-layout----file-layout)
+    - [Method style — `--style`](#method-style----style)
+    - [Optional fields — `--optional`](#optional-fields----optional)
+    - [Inheritance — `--inheritance`](#inheritance----inheritance)
+- [OpenAPI coverage](#openapi-coverage)
+- [Checking the output — `--check`](#checking-the-output----check)
+- [Limitations](#limitations)
+- [Development](#development)
+- [License](#license)
+
 ## Why
 
 - **Actually typed.** Models, parameters, and return values carry real annotations;
@@ -60,6 +88,26 @@ with AcmeClient(base_url="https://api.example.com", token="...") as client:
     pet = client.pets.get_pet(pet_id=1)   # -> a typed model
     print(pet.name)
 ```
+
+## Alternative: the unihttp agent skills
+
+No spec, or you would rather have the client written for you?
+[unihttp](https://github.com/goduni/unihttp) ships
+[agent skills](https://github.com/goduni/unihttp#agent-skills) for Claude Code, Codex,
+and other `.agents/`-aware agents. `unihttp-client` scaffolds the same kind of packaged,
+typed client — models, request classes, a client, `ruff`/`mypy` config, and tests —
+from an OpenAPI 3.x spec **or from a plain description of the API**; `unihttp` teaches
+the agent to write idiomatic unihttp code by hand.
+
+```bash
+claude plugin marketplace add goduni/unihttp
+claude plugin install unihttp@unihttp
+```
+
+Which to use: this generator is deterministic and regenerable — the same spec always
+produces the same package, and it swallows specs far larger than an agent's context.
+Reach for the skills when there is no machine-readable spec at all, or when you want a
+small client shaped by hand as it is written.
 
 ## What you get
 
@@ -205,7 +253,7 @@ unihttp-openapi-generator generate SPEC [options]
 | `--optional` | `none` · `omitted` (`none`) — `omitted` distinguishes absent from null (adaptix) |
 | `--strip-prefix` | `auto` or a dotted prefix to drop from schema names (e.g. `io.k8s.api.core.v1.Pod` → `CoreV1Pod`) |
 | `--inheritance` | off by default — render `allOf: [$ref]` as a base class instead of merging its fields in |
-| `--check` | run `ruff` and `mypy --strict` on the output ([details](#checking-the-output--check)) |
+| `--check` | run `ruff` and `mypy --strict` on the output ([details](#checking-the-output----check)) |
 | `--config` | TOML config file |
 
 ### Config file
@@ -456,25 +504,6 @@ uv add --dev unihttp-openapi-generator
   `pydantic` and `msgspec` they are limited.
 - Swagger / OpenAPI 2.0 is not supported (use the OpenAPI 3 description if a service
   publishes both, as Kubernetes does).
-
-## Without a spec — unihttp's agent skills
-
-[unihttp](https://github.com/goduni/unihttp) ships
-[agent skills](https://github.com/goduni/unihttp#agent-skills) that let a coding agent
-(Claude Code, Codex, …) write the client instead. `unihttp-client` scaffolds the same
-kind of packaged, typed client — models, request classes, a client, `ruff`/`mypy`
-config, and tests — from an OpenAPI 3.x spec **or from a plain description of the API**;
-`unihttp` teaches the agent to write idiomatic unihttp code by hand.
-
-```bash
-claude plugin marketplace add goduni/unihttp
-claude plugin install unihttp@unihttp
-```
-
-Which to use: this generator is deterministic and regenerable — the same spec always
-produces the same package, and it swallows specs far larger than an agent's context.
-Reach for the skill when there is no machine-readable spec at all, or when you want a
-small client shaped by hand as it is written.
 
 ## Development
 
