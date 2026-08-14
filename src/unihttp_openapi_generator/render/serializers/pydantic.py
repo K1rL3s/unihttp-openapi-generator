@@ -161,7 +161,8 @@ class PydanticStrategy(SerializerStrategy):
             # ``model_config`` used to keep the body non-empty for free.
             lines.append("    pass")
         for f in model.fields:
-            lines.append("    " + self._field_line(f))
+            ignore = "  # type: ignore[assignment]" if f.ignore_assignment else ""
+            lines.append("    " + self._field_line(f) + ignore)
         return "\n".join(lines)
 
     def _field_line(self, f: IRField) -> str:

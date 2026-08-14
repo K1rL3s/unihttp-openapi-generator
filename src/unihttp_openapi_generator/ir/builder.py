@@ -263,7 +263,7 @@ class IRBuilder:
                 inherited = self._inherited_fields(by_name, decl.base_model)
                 self._restore_required_narrowing(decl, inherited)
                 self._retype_discriminator_tag(decl, inherited, by_name)
-                self._drop_unsafe_overrides(decl, inherited)
+                self._mark_unsafe_overrides(decl, inherited)
                 self._rename_shadowed_fields(decl, inherited)
                 self._align_override_names(decl, inherited)
 
@@ -280,7 +280,7 @@ class IRBuilder:
         an optional field is rendered ``T | None`` whether it is optional or genuinely
         nullable, and the IR no longer distinguishes the two, so narrowing to ``T``
         could reject a null the spec allows. Same annotation is always a legal
-        override, and ``_drop_unsafe_overrides`` keeps it because requiredness differs.
+        override, and ``_mark_unsafe_overrides`` keeps it because the type is compatible.
         """
         own = {f.wire_name for f in model.fields}
         for wire in sorted(self._own_required.get(model.name, set())):
@@ -938,79 +938,26 @@ class IRBuilder:
             model.additional_properties = ANY
         return model
 
-    def _drop_unsafe_overrides(self, model: IRModel, inherited: dict[str, IRField]) -> None:
-        """Remove re-declared inherited fields that would not type-check as overrides.
-
-        Specs routinely restate a base property in a subtype just to attach prose, or to
-        relax it to nullable. Re-emitting those produces ``class Sub(Base)`` with an
-        attribute whose type is not a subtype of the base's, which ``mypy --strict``
-        rejects outright (``Incompatible types in assignment``). The base's declaration
-        already covers the field, so anything that is not a genuine narrowing is
-        dropped and simply inherited.
-
-        This also covers the pinned discriminator tag: ``_apply_discriminator_tag``
-        adds it after the model is built, and a base that types the tag property as an
-        enum (or as its own narrower ``Literal``) does not admit a subtype's
-        ``Literal`` over it.
-        """
-        kept: list[IRField] = []
+    def _mark_unsafe_overrides(self, model: IRModel, inherited: dict[str, IRField]) -> None:
+        """Mark incompatible inherited overrides for a local mypy ignore"""
         for f in model.fields:
             base_field = inherited.get(f.wire_name)
-            if base_field is None or self._is_narrowing(f.type, base_field.type):
-                kept.append(f)
+            if base_field is None:
                 continue
-            # Same annotation is always a legal override, so a restatement survives
-            # whenever it carries something the base does not.
-            if f.type.annotation() == base_field.type.annotation() and self._refines(f, base_field):
-                kept.append(f)
+            if f.type.annotation() == base_field.type.annotation() or self._is_narrowing(
+                f.type, base_field.type
+            ):
                 continue
-            widened = isinstance(f.type, OptionalType) and not isinstance(
-                base_field.type, OptionalType
+            f.ignore_assignment = True
+            logger.warning(
+                "%s.%s re-declares %s incompatibly (%s vs %s); preserving with "
+                "type: ignore[assignment]",
+                model.name,
+                f.name,
+                f.wire_name,
+                f.type.annotation(),
+                base_field.type.annotation(),
             )
-            if f.type.annotation() == base_field.type.annotation() or widened:
-                # A verbatim restatement (spec prose, usually): the base's declaration
-                # already says everything this one does, so nothing is lost by
-                # inheriting it and there is nothing for the user to act on.
-                # Restating a property to attach prose, or to relax it to nullable, is
-                # something specs do routinely and the README documents as inherited --
-                # so it is not something the user can or should act on.
-                logger.debug(
-                    "%s.%s restates inherited %s (%s); inheriting instead",
-                    model.name,
-                    f.name,
-                    f.wire_name,
-                    f.type.annotation(),
-                )
-            else:
-                # This one *does* lose information -- the subtype asked for a type the
-                # base does not admit, and the generated client will use the base's.
-                logger.warning(
-                    "%s.%s re-declares %s incompatibly (%s vs %s); inheriting instead",
-                    model.name,
-                    f.name,
-                    f.wire_name,
-                    f.type.annotation(),
-                    base_field.type.annotation(),
-                )
-        model.fields = kept
-
-    @staticmethod
-    def _refines(sub: IRField, base: IRField) -> bool:
-        """Whether a same-annotation restatement carries something the base lacks.
-
-        An identical annotation is always a legal override, so the only question is
-        whether re-emitting it changes anything:
-
-        - a different ``default`` -- dropping it hands the subtype the base's value;
-        - different ``constraints`` -- ``maxLength``/``pattern``/``minimum`` are
-          enforced by every serializer, so losing them makes the generated client
-          accept payloads the API will reject;
-        - stricter requiredness -- see ``_restore_required_narrowing``.
-        """
-        changes_default = sub.has_default and (not base.has_default or sub.default != base.default)
-        return (
-            changes_default or sub.constraints != base.constraints or sub.required != base.required
-        )
 
     @staticmethod
     def _rename_shadowed_fields(model: IRModel, inherited: dict[str, IRField]) -> None:

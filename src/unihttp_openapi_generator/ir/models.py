@@ -40,6 +40,8 @@ class IRField:
     read_only: bool = False
     write_only: bool = False
     constraints: dict[str, Any] = field(default_factory=dict)
+    ignore_assignment: bool = False
+    """Whether an incompatible inherited override needs a local mypy ignore"""
 
     @property
     def needs_alias(self) -> bool:

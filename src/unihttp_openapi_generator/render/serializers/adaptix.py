@@ -62,7 +62,10 @@ class AdaptixStrategy(SerializerStrategy):
             lines.append("    pass")
         inherited = self.inherited_field_names(model)
         for f in fields:
-            lines.append("    " + self._field_line(f.name, f.type.annotation(), f, inherited))
+            ignore = "  # type: ignore[assignment]" if f.ignore_assignment else ""
+            lines.append(
+                "    " + self._field_line(f.name, f.type.annotation(), f, inherited) + ignore
+            )
         return "\n".join(lines)
 
     @staticmethod
