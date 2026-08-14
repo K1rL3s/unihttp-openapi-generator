@@ -166,9 +166,10 @@ def hierarchy_spec() -> dict[str, Any]:
     Every schema here stands for one rule the mode has to get right, and each was a
     real defect at some point: a discriminated base that keeps its own properties, a
     tag the base types as an enum (so the subtype's ``Literal`` is not assignable),
-    restatements that only add prose / relax to nullable / change a default, wire names
-    that snake-case onto an inherited identifier, a three-level chain, and a base whose
-    own body refers back to its subtype.
+    a named enum that narrows ``str``, restatements that only add prose / relax to
+    nullable / change a default, wire names that snake-case onto an inherited
+    identifier, a three-level chain, and a base whose own body refers back to its
+    subtype.
     """
     return {
         "openapi": "3.1.0",
@@ -238,6 +239,21 @@ def hierarchy_spec() -> dict[str, Any]:
         "components": {
             "schemas": {
                 "ButtonKind": {"type": "string", "enum": ["callback", "link"]},
+                "Kind": {"type": "string", "enum": ["one", "two"]},
+                "KindParent": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"type": "string"}},
+                },
+                "KindChild": {
+                    "allOf": [
+                        {"$ref": "#/components/schemas/KindParent"},
+                        {
+                            "required": ["kind"],
+                            "properties": {"kind": {"$ref": "#/components/schemas/Kind"}},
+                        },
+                    ]
+                },
                 "Button": {
                     "type": "object",
                     "description": "A discriminated base with properties of its own.",

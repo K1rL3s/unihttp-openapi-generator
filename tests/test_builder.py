@@ -1667,3 +1667,28 @@ def test_retype_discriminator_tag_needs_the_value_to_be_an_enum_member() -> None
     sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "Sub")
     assert sub.base_model == "Base"
     assert [f.wire_name for f in sub.fields] == ["a"]
+
+
+def test_inheritance_keeps_named_string_enum_narrowing() -> None:
+    """A named string enum is a valid narrowing of an inherited ``str`` field."""
+    spec = _hier(
+        {
+            "Kind": {"type": "string", "enum": ["one", "two"]},
+            "Parent": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {"kind": {"type": "string"}},
+            },
+            "Child": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Parent"},
+                    {
+                        "required": ["kind"],
+                        "properties": {"kind": {"$ref": "#/components/schemas/Kind"}},
+                    },
+                ]
+            },
+        }
+    )
+    child = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "Child")
+    assert [field.type.annotation() for field in child.fields] == ["Kind"]

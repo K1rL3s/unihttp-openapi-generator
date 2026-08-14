@@ -263,7 +263,7 @@ class IRBuilder:
                 inherited = self._inherited_fields(by_name, decl.base_model)
                 self._restore_required_narrowing(decl, inherited)
                 self._retype_discriminator_tag(decl, inherited, by_name)
-                self._drop_unsafe_overrides(decl, inherited)
+                self._drop_unsafe_overrides(decl, inherited, by_name)
                 self._rename_shadowed_fields(decl, inherited)
                 self._align_override_names(decl, inherited)
 
@@ -938,7 +938,12 @@ class IRBuilder:
             model.additional_properties = ANY
         return model
 
-    def _drop_unsafe_overrides(self, model: IRModel, inherited: dict[str, IRField]) -> None:
+    def _drop_unsafe_overrides(
+        self,
+        model: IRModel,
+        inherited: dict[str, IRField],
+        declarations: dict[str, Declaration],
+    ) -> None:
         """Remove re-declared inherited fields that would not type-check as overrides.
 
         Specs routinely restate a base property in a subtype just to attach prose, or to
@@ -956,7 +961,7 @@ class IRBuilder:
         kept: list[IRField] = []
         for f in model.fields:
             base_field = inherited.get(f.wire_name)
-            if base_field is None or self._is_narrowing(f.type, base_field.type):
+            if base_field is None or self._is_narrowing(f.type, base_field.type, declarations):
                 kept.append(f)
                 continue
             # Same annotation is always a legal override, so a restatement survives
@@ -1054,7 +1059,12 @@ class IRBuilder:
                 f.name = base_field.name
 
     @classmethod
-    def _is_narrowing(cls, sub: IRType, base: IRType) -> bool:
+    def _is_narrowing(
+        cls,
+        sub: IRType,
+        base: IRType,
+        declarations: dict[str, Declaration] | None = None,
+    ) -> bool:
         """Whether ``sub`` is safe to re-declare over an inherited ``base`` annotation.
 
         Deliberately conservative: it only says yes for the shapes that are provably
@@ -1065,12 +1075,18 @@ class IRBuilder:
             return False  # a pure restatement: nothing to gain, just inherit it
         if isinstance(base, PrimitiveType) and base.py == "Any":
             return True
+        if isinstance(sub, RefType) and declarations is not None:
+            declaration = declarations.get(sub.name)
+            if isinstance(declaration, IREnum) and isinstance(base, PrimitiveType):
+                return declaration.base == base.py
         if isinstance(sub, OptionalType) and isinstance(base, OptionalType):
             # ``T | None`` narrows ``U | None`` exactly when ``T`` narrows ``U``.
-            return cls._is_narrowing(sub.inner, base.inner)
+            return cls._is_narrowing(sub.inner, base.inner, declarations)
         if isinstance(base, OptionalType):
             # ``T | None`` admits ``T`` and anything that narrows ``T``.
-            return sub.annotation() == base.inner.annotation() or cls._is_narrowing(sub, base.inner)
+            return sub.annotation() == base.inner.annotation() or cls._is_narrowing(
+                sub, base.inner, declarations
+            )
         if isinstance(sub, OptionalType):
             return False  # adding None to a non-optional base widens it
         if isinstance(sub, LiteralType):
@@ -1084,7 +1100,7 @@ class IRBuilder:
             return isinstance(base, PrimitiveType) and cls._literals_fit(sub.values, base.py)
         if isinstance(base, UnionType):
             return any(
-                cls._is_narrowing(sub, m) or sub.annotation() == m.annotation()
+                cls._is_narrowing(sub, m, declarations) or sub.annotation() == m.annotation()
                 for m in base.members
             )
         return False
