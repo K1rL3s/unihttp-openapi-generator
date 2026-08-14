@@ -12,6 +12,7 @@ from unihttp_openapi_generator.ir.models import IRAlias, IREnum, IRModel
 from unihttp_openapi_generator.ir.operations import BodyKind, ParamLocation
 from unihttp_openapi_generator.ir.types import (
     BOOL,
+    FLOAT,
     INT,
     STR,
     ListType,
@@ -1484,6 +1485,8 @@ def test_allof_cycle_merges_the_dropped_base_instead_of_losing_its_fields() -> N
         # both optional: compare the inners
         (OptionalType(LiteralType(("a",))), OptionalType(STR), True),
         (OptionalType(STR), OptionalType(INT), False),
+        # mypy's numeric tower admits an integer wherever a float is expected
+        (INT, FLOAT, True),
     ],
 )
 def test_is_narrowing_type_shapes(sub: Any, base: Any, expected: bool) -> None:
@@ -1674,3 +1677,30 @@ def test_retype_discriminator_tag_needs_the_value_to_be_an_enum_member() -> None
     assert sub.base_model == "Base"
     assert [field.wire_name for field in sub.fields] == ["kind", "a"]
     assert sub.fields[0].ignore_assignment is True
+
+
+def test_required_narrowing_recomputes_inherited_assignment_ignore() -> None:
+    spec = _hier(
+        {
+            "A": {"type": "object", "properties": {"v": {"type": "string"}}},
+            "B": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/A"},
+                    {"properties": {"v": {"type": "integer"}}},
+                ]
+            },
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/B"},
+                    {"required": ["v"]},
+                ]
+            },
+        }
+    )
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    b_field = next(field for field in _decl(ir, "B").fields if field.wire_name == "v")
+    c_field = next(field for field in _decl(ir, "C").fields if field.wire_name == "v")
+
+    assert b_field.ignore_assignment is True
+    assert c_field.required is True
+    assert c_field.ignore_assignment is False

@@ -942,6 +942,7 @@ class IRBuilder:
         """Mark incompatible inherited overrides for a local mypy ignore"""
         for f in model.fields:
             base_field = inherited.get(f.wire_name)
+            f.ignore_assignment = False
             if base_field is None:
                 continue
             if f.type.annotation() == base_field.type.annotation() or self._is_narrowing(
@@ -1012,6 +1013,8 @@ class IRBuilder:
             return False  # a pure restatement: nothing to gain, just inherit it
         if isinstance(base, PrimitiveType) and base.py == "Any":
             return True
+        if isinstance(sub, PrimitiveType) and isinstance(base, PrimitiveType):
+            return sub.py == "int" and base.py == "float"
         if isinstance(sub, OptionalType) and isinstance(base, OptionalType):
             # ``T | None`` narrows ``U | None`` exactly when ``T`` narrows ``U``.
             return cls._is_narrowing(sub.inner, base.inner)
