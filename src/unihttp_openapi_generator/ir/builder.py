@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 from urllib.parse import urlsplit
@@ -59,6 +60,11 @@ from unihttp_openapi_generator.refs import RefResolver
 logger = logging.getLogger(__name__)
 
 _HTTP_METHODS = ("get", "put", "post", "delete", "patch", "head", "options", "trace")
+
+# Python's numeric tower as mypy applies it: an ``int`` is accepted wherever a ``float``
+# is expected, and a ``bool`` wherever an ``int`` is. A subtype re-typing ``number`` as
+# ``integer`` is an ordinary OpenAPI narrowing, so it must not read as incompatible.
+_PROMOTIONS = frozenset({("int", "float"), ("bool", "int"), ("bool", "float")})
 
 # Identifiers imported into generated modules; a model/method class must never reuse one
 # or it would shadow the import (markers, unihttp core, serializer bases, common types).
@@ -263,7 +269,7 @@ class IRBuilder:
                 inherited = self._inherited_fields(by_name, decl.base_model)
                 self._restore_required_narrowing(decl, inherited)
                 self._retype_discriminator_tag(decl, inherited, by_name)
-                self._mark_unsafe_overrides(decl, inherited)
+                self._mark_unsafe_overrides(decl, inherited, by_name)
                 self._rename_shadowed_fields(decl, inherited)
                 self._align_override_names(decl, inherited)
 
@@ -280,7 +286,7 @@ class IRBuilder:
         an optional field is rendered ``T | None`` whether it is optional or genuinely
         nullable, and the IR no longer distinguishes the two, so narrowing to ``T``
         could reject a null the spec allows. Same annotation is always a legal
-        override, and ``_mark_unsafe_overrides`` keeps it because the type is compatible.
+        override, so ``_mark_unsafe_overrides`` leaves the re-declaration unflagged.
         """
         own = {f.wire_name for f in model.fields}
         for wire in sorted(self._own_required.get(model.name, set())):
@@ -295,6 +301,9 @@ class IRBuilder:
                     has_default=False,
                     omittable=False,
                     constraints=dict(base_field.constraints),
+                    # Judged against *this* model's base chain, not the one the copied
+                    # field was flagged for; ``_mark_unsafe_overrides`` runs next.
+                    incompatible_override=False,
                 )
             )
 
@@ -938,23 +947,39 @@ class IRBuilder:
             model.additional_properties = ANY
         return model
 
-    def _mark_unsafe_overrides(self, model: IRModel, inherited: dict[str, IRField]) -> None:
-        """Mark incompatible inherited overrides for a local mypy ignore"""
+    def _mark_unsafe_overrides(
+        self,
+        model: IRModel,
+        inherited: dict[str, IRField],
+        by_name: dict[str, Declaration],
+    ) -> None:
+        """Flag re-declared inherited fields whose type the base does not admit.
+
+        Every property a subtype declares stays on the subtype, so the flag records
+        only that the spec asked for something ``class Sub(Base)`` cannot express
+        soundly; the serializers decide what to emit for it.
+
+        A spec that does this is inconsistent -- the subtype is not substitutable for
+        its base -- and that is worth fixing in the spec rather than in its clients, so
+        every occurrence is logged with the schema and property it comes from.
+        """
         for f in model.fields:
             base_field = inherited.get(f.wire_name)
-            f.ignore_assignment = False
+            # Always assigned, never only set: ``_restore_required_narrowing`` copies
+            # fields down from the base chain, flag and all, and the copy is judged
+            # against a different base than the original was.
+            f.incompatible_override = False
             if base_field is None:
                 continue
             if f.type.annotation() == base_field.type.annotation() or self._is_narrowing(
-                f.type, base_field.type
+                f.type, base_field.type, by_name
             ):
                 continue
-            f.ignore_assignment = True
+            f.incompatible_override = True
             logger.warning(
-                "%s.%s re-declares %s incompatibly (%s vs %s); preserving with "
-                "type: ignore[assignment]",
+                "%s re-declares %r as %s, which the inherited %s does not admit; "
+                "the subtype is not substitutable for its base -- fix the schema",
                 model.name,
-                f.name,
                 f.wire_name,
                 f.type.annotation(),
                 base_field.type.annotation(),
@@ -1002,25 +1027,36 @@ class IRBuilder:
                 f.name = base_field.name
 
     @classmethod
-    def _is_narrowing(cls, sub: IRType, base: IRType) -> bool:
+    def _is_narrowing(
+        cls, sub: IRType, base: IRType, by_name: Mapping[str, Declaration] | None = None
+    ) -> bool:
         """Whether ``sub`` is safe to re-declare over an inherited ``base`` annotation.
 
-        Deliberately conservative: it only says yes for the shapes that are provably
-        assignable, because a false yes emits code that fails ``mypy --strict`` while a
-        false no merely inherits a slightly less precise type.
+        Only says yes for shapes that are provably assignable, and a no is answered by
+        emitting the declaration under a suppression comment rather than by dropping
+        it -- so a false no costs a line of noise in the output, not a lost property.
+        The suppression carries ``unused-ignore`` for exactly that reason.
+
+        ``by_name`` resolves ``$ref`` narrowings: ``Dog`` over ``Animal`` is assignable
+        only if the generated ``Dog`` really does subclass ``Animal``, which nothing in
+        either annotation says. Omitting it just makes those answer no.
         """
         if sub.annotation() == base.annotation():
             return False  # a pure restatement: nothing to gain, just inherit it
         if isinstance(base, PrimitiveType) and base.py == "Any":
             return True
         if isinstance(sub, PrimitiveType) and isinstance(base, PrimitiveType):
-            return sub.py == "int" and base.py == "float"
+            return (sub.py, base.py) in _PROMOTIONS
+        if isinstance(sub, RefType) and isinstance(base, RefType):
+            return cls._extends(sub.name, base.name, by_name)
         if isinstance(sub, OptionalType) and isinstance(base, OptionalType):
             # ``T | None`` narrows ``U | None`` exactly when ``T`` narrows ``U``.
-            return cls._is_narrowing(sub.inner, base.inner)
+            return cls._is_narrowing(sub.inner, base.inner, by_name)
         if isinstance(base, OptionalType):
             # ``T | None`` admits ``T`` and anything that narrows ``T``.
-            return sub.annotation() == base.inner.annotation() or cls._is_narrowing(sub, base.inner)
+            return sub.annotation() == base.inner.annotation() or cls._is_narrowing(
+                sub, base.inner, by_name
+            )
         if isinstance(sub, OptionalType):
             return False  # adding None to a non-optional base widens it
         if isinstance(sub, LiteralType):
@@ -1034,9 +1070,28 @@ class IRBuilder:
             return isinstance(base, PrimitiveType) and cls._literals_fit(sub.values, base.py)
         if isinstance(base, UnionType):
             return any(
-                cls._is_narrowing(sub, m) or sub.annotation() == m.annotation()
+                cls._is_narrowing(sub, m, by_name) or sub.annotation() == m.annotation()
                 for m in base.members
             )
+        # Containers land here: ``list``/``dict`` are invariant, so a narrowed element
+        # type is not a narrowed container.
+        return False
+
+    @staticmethod
+    def _extends(sub: str, base: str, by_name: Mapping[str, Declaration] | None) -> bool:
+        """Whether the model named ``sub`` inherits from ``base``, however deep."""
+        if by_name is None:
+            return False
+        seen: set[str] = set()
+        current: str | None = sub
+        while current is not None and current not in seen:
+            seen.add(current)
+            decl = by_name.get(current)
+            if not isinstance(decl, IRModel):
+                return False
+            if decl.base_model == base:
+                return True
+            current = decl.base_model
         return False
 
     @staticmethod

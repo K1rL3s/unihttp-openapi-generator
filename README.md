@@ -446,10 +446,14 @@ What to do with `allOf: [{$ref: Base}, ...]`.
     pin an inherited field to a default while adding required fields of its own, which
     positional ordering cannot express. Models outside every hierarchy are untouched.
   - A property explicitly declared by a subtype stays on that subtype, even when it is
-    identical to the inherited property. Compatible overrides render normally. An
-    incompatible override, such as `v: str | None` over `v: str`, gets a local
-    `# type: ignore[assignment]` so the generated model preserves the schema and still
-    passes `mypy --strict`.
+    identical to the inherited property. Compatible overrides render normally — that
+    includes narrowing a `$ref` to a schema that inherits from the base's
+    (`companion: Pet` over `companion: Creature`) and `integer` over `number`. An
+    override the base cannot admit, such as `v: str | None` over `v: str`, means the
+    subtype is not substitutable for its base: that is a defect in the spec and worth
+    fixing there, so it is reported as a warning. The generated model stays faithful to
+    the schema and carries a local `# type: ignore[assignment, unused-ignore]`, which
+    keeps it clean under `mypy --strict` either way.
   - Naming an inherited property in the subtype's `required` **without** restating the
     property still tightens it: the subtype re-declares it with the base's annotation
     and no default, so the constructor demands it.

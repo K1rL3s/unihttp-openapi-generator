@@ -459,7 +459,9 @@ def test_incompatible_explicit_override_gets_local_ignore(
     source = render_models_module(ir, get_strategy(serializer))
     line = next(line for line in source.splitlines() if "value: str | None" in line)
 
-    assert line.endswith("  # type: ignore[assignment]")
+    # ``unused-ignore`` rides along so the comment stays clean under ``mypy --strict``
+    # wherever mypy is more permissive than the IR's view of the two types.
+    assert line.endswith("  # type: ignore[assignment, unused-ignore]")
     _load(source, tmp_path, f"incompatible_override_{serializer.value}")
 
 

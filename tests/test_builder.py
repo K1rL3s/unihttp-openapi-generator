@@ -793,10 +793,10 @@ def test_inheritance_keeps_explicit_restatement(inherited: IRDocument) -> None:
     assert text.required is True
     assert text.type.annotation() == "str"
     assert text.description == "Visible label."
-    assert text.ignore_assignment is False
+    assert text.incompatible_override is False
     label = next(f for f in sub.fields if f.name == "label")
     assert label.description is None
-    assert label.ignore_assignment is False
+    assert label.incompatible_override is False
 
 
 def test_inheritance_keeps_widening_restatement() -> None:
@@ -821,7 +821,7 @@ def test_inheritance_keeps_widening_restatement() -> None:
     assert isinstance(sub, IRModel)
     assert sub.base_model == "P"
     assert [field.name for field in sub.fields] == ["v"]
-    assert sub.fields[0].ignore_assignment is True
+    assert sub.fields[0].incompatible_override is True
 
 
 def test_inheritance_keeps_narrowing_restatement() -> None:
@@ -1141,7 +1141,7 @@ def test_inheritance_checks_the_whole_base_chain() -> None:
     fields = _decl(ir, "C").fields
 
     assert [field.name for field in fields] == ["v", "c"]
-    assert fields[0].ignore_assignment is True
+    assert fields[0].incompatible_override is True
 
 
 def test_inheritance_renames_a_field_shadowing_an_inherited_identifier() -> None:
@@ -1316,7 +1316,7 @@ def test_inheritance_literal_over_a_mismatched_primitive_is_not_a_narrowing() ->
     sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "C")
     assert sub.base_model == "P"
     assert [field.name for field in sub.fields] == ["k"]
-    assert sub.fields[0].ignore_assignment is True
+    assert sub.fields[0].incompatible_override is True
 
     # the same restatement over a ``str`` base *is* a genuine narrowing and stays
     spec["components"]["schemas"]["P"]["properties"]["k"] = {"type": "string"}
@@ -1476,7 +1476,9 @@ def test_allof_cycle_merges_the_dropped_base_instead_of_losing_its_fields() -> N
         (LiteralType(("c",)), LiteralType(("a", "b")), False),
         # union base: narrowing any one member is enough
         (STR, UnionType((STR, INT)), True),
-        (BOOL, UnionType((STR, INT)), False),
+        # via the ``int`` member, since a bool is an int as far as mypy is concerned
+        (BOOL, UnionType((STR, INT)), True),
+        (FLOAT, UnionType((STR, INT)), False),
         # a Literal is answered against the base's *own* shape before the union branch
         # is reached, so this is a deliberate false no: the subtype inherits the wider
         # annotation instead of narrowing it. Safe, since a false yes emits code that
@@ -1485,8 +1487,15 @@ def test_allof_cycle_merges_the_dropped_base_instead_of_losing_its_fields() -> N
         # both optional: compare the inners
         (OptionalType(LiteralType(("a",))), OptionalType(STR), True),
         (OptionalType(STR), OptionalType(INT), False),
-        # mypy's numeric tower admits an integer wherever a float is expected
+        # mypy's numeric tower admits an integer wherever a float is expected, and a
+        # bool wherever an int is
         (INT, FLOAT, True),
+        (BOOL, INT, True),
+        (FLOAT, INT, False),
+        # containers are invariant: a narrowed element is not a narrowed container
+        (ListType(INT), ListType(FLOAT), False),
+        # a $ref answers no without a declaration map to check the base chain in
+        (RefType("Dog"), RefType("Animal"), False),
     ],
 )
 def test_is_narrowing_type_shapes(sub: Any, base: Any, expected: bool) -> None:
@@ -1602,7 +1611,7 @@ def test_retype_discriminator_tag_leaves_non_enum_bases_alone() -> None:
     # assignment ignore
     obj_fields = _decl(ir, "ObjSub").fields
     assert [field.wire_name for field in obj_fields] == ["kind", "b"]
-    assert obj_fields[0].ignore_assignment is True
+    assert obj_fields[0].incompatible_override is True
 
     own = next(f for f in _decl(ir, "OwnLiteral").fields if f.wire_name == "mode")
     assert own.default_expr is None
@@ -1676,7 +1685,7 @@ def test_retype_discriminator_tag_needs_the_value_to_be_an_enum_member() -> None
     sub = _decl(build_ir(spec, RefResolver(spec), inheritance=True), "Sub")
     assert sub.base_model == "Base"
     assert [field.wire_name for field in sub.fields] == ["kind", "a"]
-    assert sub.fields[0].ignore_assignment is True
+    assert sub.fields[0].incompatible_override is True
 
 
 def test_required_narrowing_recomputes_inherited_assignment_ignore() -> None:
@@ -1701,6 +1710,84 @@ def test_required_narrowing_recomputes_inherited_assignment_ignore() -> None:
     b_field = next(field for field in _decl(ir, "B").fields if field.wire_name == "v")
     c_field = next(field for field in _decl(ir, "C").fields if field.wire_name == "v")
 
-    assert b_field.ignore_assignment is True
+    assert b_field.incompatible_override is True
     assert c_field.required is True
-    assert c_field.ignore_assignment is False
+    assert c_field.incompatible_override is False
+
+
+def test_inheritance_ref_narrowed_to_a_subclass_is_compatible() -> None:
+    """``Dog`` over ``Animal`` is a legal override once the base chain is consulted.
+
+    Both sides are a bare ``RefType``; only the declaration map says one subclasses the
+    other. Flagging it would put a suppression comment on a line mypy is happy with.
+    """
+    spec = _hier(
+        {
+            "Animal": {"type": "object", "properties": {"name": {"type": "string"}}},
+            "Dog": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Animal"},
+                    {"properties": {"breed": {"type": "string"}}},
+                ]
+            },
+            "Keeper": {
+                "type": "object",
+                "required": ["pet"],
+                "properties": {"pet": {"$ref": "#/components/schemas/Animal"}},
+            },
+            "DogKeeper": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/Keeper"},
+                    {
+                        "required": ["pet"],
+                        "properties": {"pet": {"$ref": "#/components/schemas/Dog"}},
+                    },
+                ]
+            },
+        }
+    )
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    pet = next(field for field in _decl(ir, "DogKeeper").fields if field.wire_name == "pet")
+
+    assert pet.type.annotation() == "Dog"
+    assert pet.incompatible_override is False
+
+    # the same override the other way round *is* incompatible
+    schemas = spec["components"]["schemas"]
+    schemas["Keeper"]["properties"]["pet"] = {"$ref": "#/components/schemas/Dog"}
+    schemas["DogKeeper"]["allOf"][1]["properties"]["pet"] = {"$ref": "#/components/schemas/Animal"}
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    pet = next(field for field in _decl(ir, "DogKeeper").fields if field.wire_name == "pet")
+
+    assert pet.incompatible_override is True
+
+    # and a ``$ref`` to something that is not a class at all has no chain to walk
+    schemas["Kind"] = {"type": "string", "enum": ["dog", "cat"]}
+    schemas["DogKeeper"]["allOf"][1]["properties"]["pet"] = {"$ref": "#/components/schemas/Kind"}
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    pet = next(field for field in _decl(ir, "DogKeeper").fields if field.wire_name == "pet")
+
+    assert pet.incompatible_override is True
+
+
+def test_inheritance_integer_over_number_is_compatible() -> None:
+    spec = _hier(
+        {
+            "P": {
+                "type": "object",
+                "required": ["v"],
+                "properties": {"v": {"type": "number"}},
+            },
+            "C": {
+                "allOf": [
+                    {"$ref": "#/components/schemas/P"},
+                    {"required": ["v"], "properties": {"v": {"type": "integer"}}},
+                ]
+            },
+        }
+    )
+    ir = build_ir(spec, RefResolver(spec), inheritance=True)
+    v = next(field for field in _decl(ir, "C").fields if field.wire_name == "v")
+
+    assert v.type.annotation() == "int"
+    assert v.incompatible_override is False

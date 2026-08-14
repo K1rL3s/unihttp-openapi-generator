@@ -74,8 +74,7 @@ class MsgspecStrategy(SerializerStrategy):
             lines.append(doc.rstrip("\n"))
         fields = sorted(model.fields, key=self._sort_key)
         for f in fields:
-            ignore = "  # type: ignore[assignment]" if f.ignore_assignment else ""
-            lines.append("    " + self._field_line(f) + ignore)
+            lines.append("    " + self._field_line(f) + self.override_suppression(f))
         if not fields and not doc:
             lines.append("    pass")
         return "\n".join(lines)
